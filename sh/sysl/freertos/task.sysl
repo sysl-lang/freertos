@@ -1,0 +1,307 @@
+module sh.sysl.freertos
+
+@include("FreeRTOS.h")
+@include("task.h")
+
+import sysl.slices.as_mut_ptr
+
+// Tasks -- the thing FreeRTOS is for.
+//
+// A task is a function that never returns, given its own stack and a priority. `task` creates one
+// from the kernel's heap and `task_static` from storage you own; either way nothing runs until
+// `start` is called, and after that the highest-priority ready task runs.
+//
+// **A task body is a C function pointer, not a closure.** `*extern(*u8) -> unit` is the shape,
+// which is `TaskFunction_t` exactly. A closure cannot be one: it would have to be boxed, and its
+// captures would be values crossing into another domain, which is what `06`'s crossing rules are
+// about. What a body gets instead is the `*u8` handed to `task`, which is an address -- and whatever
+// is at that address is shared, so those rules apply to it. A plain `&T` may not cross; `&sync T`
+// may.
+
+// What the kernel calls a task. Only ever held by pointer: its size is the kernel's business and its
+// contents are the scheduler's.
+opaque struct TaskControlBlock
+
+/** Where a task is in the scheduler's view of it, which is `eTaskGetState`.
+ *
+ * `Invalid` is the kernel's own `eInvalid` and means the handle names nothing it knows about, which
+ * after `delete` is what a stale handle answers. `Deleted` is narrower and more interesting: the
+ * task has been deleted but the idle task has not yet reclaimed its stack.
+ */
+enum TaskState
+    Running
+    Ready
+    Blocked
+    Suspended
+    Deleted
+    Invalid
+
+// One task. This is a handle rather than the task itself -- copying it copies the handle, and the
+// task goes on running.
+struct Task
+    private[freertos] handle: *TaskControlBlock
+
+    /** The priority the scheduler is using, and the one the task was created with.
+     *
+     * These differ while the task holds a mutex that a higher-priority task is waiting for: the
+     * kernel raises the holder to the waiter's priority so the mutex is released promptly, and
+     * `priority` reports the raised figure while `base_priority` reports the task's own. A task
+     * holding no mutex answers the same for both.
+     */
+    priority -> usize = c_task_priority(self.handle)
+
+    base_priority -> usize = c_task_base_priority(self.handle)
+
+    /** Where the scheduler thinks this task is.
+     *
+     * Needs `INCLUDE_eTaskGetState 1`. A handle whose task has been deleted and reclaimed answers
+     * `Invalid`, which is the kernel's own answer rather than a guess.
+     */
+    state -> TaskState
+        val s = c_task_state(self.handle)
+
+        if s == state_running then Running
+        else if s == state_ready then Ready
+        else if s == state_blocked then Blocked
+        else if s == state_suspended then Suspended
+        else if s == state_deleted then Deleted
+        else Invalid
+    end state
+
+    /** How many words of this task's stack have never been used.
+     *
+     * The kernel fills a new stack with a known pattern and this counts back from the far end to the
+     * first byte that still matches, so it is a high-water mark for the whole life of the task
+     * rather than a reading of the moment. **Zero means the stack has been used to its very last
+     * word**, which is not a margin -- it is a report that the next call might have overflowed.
+     *
+     * Needs `INCLUDE_uxTaskGetStackHighWaterMark 1`, and it is the number to look at before trimming
+     * a stack.
+     */
+    stack_high_water -> usize = c_task_high_water(self.handle)
+
+    /** Delete this task, freeing what the kernel allocated for it.
+     *
+     * A task may delete itself, and a task body that has finished must do something -- returning
+     * from one is undefined and the kernel calls `configASSERT`. Deleting yourself does not return.
+     *
+     * The stack and control block of a deleted task are reclaimed by the **idle task**, so a program
+     * that deletes tasks and never lets the idle task run leaks them. A statically created task's
+     * storage is yours and is not touched.
+     */
+    delete(self) = c_task_delete(self.handle)
+
+    /** Take this task out of the scheduler's reckoning, and put it back.
+     *
+     * Suspension is not a count: one `resume` undoes any number of `suspend`s. A suspended task that
+     * was blocked on a queue stays blocked when resumed, with whatever is left of its timeout.
+     */
+    suspend(self) = c_task_suspend(self.handle)
+
+    resume(self) = c_task_resume(self.handle)
+
+    set_priority(self, priority: usize) = c_task_set_priority(self.handle, priority)
+
+    /** Add one to this task's notification value, waking it if it is waiting.
+     *
+     * The lightweight signal `notify_take` is the other half of. It always succeeds -- there is no
+     * queue to be full -- which is the other reason to prefer it to a semaphore.
+     */
+    notify_give(self) -> bool = c_notify(self.handle, 0, 0, action_increment, null) == pass
+
+    /** Set bits in this task's notification value, waking it if it is waiting.
+     *
+     * The bit-field half, with `notify_wait` at the other end. Also always succeeds.
+     */
+    notify_set_bits(self, bits: u32) -> bool =
+        c_notify(self.handle, 0, bits, action_set_bits, null) == pass
+end Task
+
+// The name the kernel keeps, which it copies into the control block and truncates to
+// `configMAX_TASK_NAME_LEN` including the terminator. Measured rather than assumed, because it is a
+// config knob -- and it is also the reason a name needs no allocation: the buffer has to live only
+// as long as the create call.
+private[freertos] c const
+    name_len: usize = "configMAX_TASK_NAME_LEN"
+
+// How big a statically created task's control block has to be, in words of `StackType_t`.
+//
+// Rounded up rather than divided, and in words rather than bytes for the alignment reason
+// `task_static` explains. The queue and semaphore sizes are the same shape for the same reason.
+c const
+    task_words: usize = "(sizeof(StaticTask_t) + sizeof(StackType_t) - 1) / sizeof(StackType_t)"
+
+// The `eNotifyAction` an `xTaskGenericNotify` carries, and the `eTaskState` one comes back as. These
+// are enumerators rather than macros, and a C expression naming one is still a C expression, so
+// `c const` reads them exactly as it reads a `#define`.
+private[freertos] c const
+    action_set_bits: isize  = "eSetBits"
+    action_increment: isize = "eIncrement"
+    state_running: isize    = "eRunning"
+    state_ready: isize      = "eReady"
+    state_blocked: isize    = "eBlocked"
+    state_suspended: isize  = "eSuspended"
+    state_deleted: isize    = "eDeleted"
+
+/** Create a task from the kernel's heap, `None` if there is not enough of it.
+ *
+ * `stack_words` is a count of `StackType_t`, not of bytes -- the kernel's own convention -- and
+ * `min_stack` is the floor below which the port cannot run a task at all. `arg` is handed to the
+ * body as its only parameter and may be `null`.
+ *
+ * The name is copied into the task's control block, so nothing here allocates and the string need
+ * not outlive the call. A name longer than `configMAX_TASK_NAME_LEN - 1` bytes is truncated, exactly
+ * as the kernel would truncate it.
+ *
+ * `None` means one of two things and the kernel distinguishes only the first: `configTOTAL_HEAP_SIZE`
+ * had no room for the stack and control block, or `stack_words` does not fit
+ * `configSTACK_DEPTH_TYPE`. The second is checked here rather than passed on, because passing it on
+ * would truncate the depth and hand back a task with a fraction of the stack asked for -- which runs,
+ * and then overflows somewhere with nothing to connect it to this call.
+ */
+task(name: string, stack_words: usize, priority: usize, body: *extern(*u8) -> unit,
+     arg: *u8) -> Option[Task]
+    if stack_words > stack_depth_max then return None
+
+    var buf: [name_len]u8 = [0; name_len]
+    var handle: *TaskControlBlock = ptr_cast(0usize)
+
+    write_name(name, &buf[0])
+
+    if c_task_create(body, &buf[0], stack_words, arg, priority, &handle) != pass then
+        None
+    else
+        Some(Task(handle))
+end task
+
+/** Create a task from storage you own, `None` if the storage was refused.
+ *
+ * The two slices are the task's stack and its control block, and the kernel keeps both for as long
+ * as the task lives -- so they must outlive it, which in practice means module storage. Both are
+ * counted in words of `StackType_t` rather than bytes, and that is what makes them correctly
+ * aligned: a control block is not byte-aligned, so a `[N]u8` would be wrong in a way that works
+ * until it does not.
+ *
+ * `task_words` says how big `tcb` has to be. Sizing it any other way is guessing at a number only
+ * the kernel's own headers know:
+ *
+ *     var stack: [512]usize = [0; 512]
+ *     var tcb: [task_words]usize = [0; task_words]
+ *
+ *     val t = task_static("worker", stack[0..<512], tcb[0..<task_words], 2, &worker, null)
+ *
+ * This needs `configSUPPORT_STATIC_ALLOCATION 1`, and it is the whole of what a program needs in
+ * order to create a task with no heap at all.
+ */
+task_static(name: string, stack: []usize, tcb: []usize, priority: usize,
+            body: *extern(*u8) -> unit, arg: *u8) -> Option[Task]
+    if stack.len > stack_depth_max || tcb.len < task_words then return None
+
+    var buf: [name_len]u8 = [0; name_len]
+
+    write_name(name, &buf[0])
+
+    val handle = c_task_create_static(body, &buf[0], stack.len, arg, priority,
+                                      as_mut_ptr(stack), ptr_cast(as_mut_ptr(tcb)))
+
+    if handle == null then None else Some(Task(handle))
+end task_static
+
+/** The task that is running, which inside a task body is that task.
+ *
+ * Before `start` there is no such thing, so the handle is only meaningful once the scheduler is
+ * running -- `state` on one taken earlier answers `Invalid` rather than lying.
+ */
+current() -> Task = Task(c_current_task())
+
+/** Block this task for a number of ticks, or hand the processor on without blocking.
+ *
+ * `delay(0)` is what `taskYIELD` does from a task: it never blocks, and it gives the processor to
+ * another ready task at the same priority. That matters because `portYIELD` is inline assembly with
+ * no symbol to bind, so `yield_now` is the portable spelling of it and the only one this package can
+ * offer.
+ *
+ * A delay measures from *now*, so a loop that works and then delays drifts by however long the work
+ * took. `delay_until` is the one that does not.
+ */
+delay(ticks: usize) = c_task_delay(ticks)
+
+yield_now() = c_task_delay(0)
+
+/** Block until a fixed interval after the last time this returned -- a period that does not drift.
+ *
+ * `last` is the caller's own tick stamp and the kernel updates it, so it must persist between calls
+ * and be seeded once from `tick_count` before the first:
+ *
+ *     var last = tick_count()
+ *
+ *     while true
+ *         do_the_work()
+ *         delay_until(&last, ticks(100))
+ *
+ * `false` means the deadline had already passed when the call was made -- the work took longer than
+ * the interval -- and in that case it returns immediately rather than blocking for nearly a whole
+ * wrap. It is the only honest way to notice you are not keeping up.
+ */
+delay_until(last: *usize, interval: usize) -> bool = c_task_delay_until(last, interval) == yes
+
+/** Wait for a notification and take it, which is a counting semaphore that costs no object.
+ *
+ * A task's notification is a single 32-bit value in its own control block, so there is nothing to
+ * create and nothing to free -- which is why FreeRTOS's own documentation recommends it over a
+ * semaphore wherever exactly one task waits. `Task.notify_give` is the other end.
+ *
+ * `clear` decides what happens to the value on the way out: `true` zeroes it, which makes this a
+ * binary signal, and `false` decrements it, which makes it a counter. What comes back is the value
+ * as it was before either happened, so zero means the wait timed out.
+ */
+notify_take(clear: bool, wait: usize) -> u32 = c_notify_take(0, if clear then yes else 0, wait)
+
+/** Wait for a notification without consuming it, and read the value.
+ *
+ * The bit-field end of the same mechanism: `clear_on_entry` is cleared before waiting and
+ * `clear_on_exit` after, so `notify_wait(0, 0xFFFFFFFF, &v, forever)` is *wait for any bit, tell me
+ * which, and reset*. `false` means the wait timed out and `value` was not written.
+ */
+notify_wait(clear_on_entry: u32, clear_on_exit: u32, value: *u32, wait: usize) -> bool =
+    c_notify_wait(0, clear_on_entry, clear_on_exit, value, wait) == yes
+
+// Copy a name into a fixed buffer the kernel reads during the create call, terminator included.
+//
+// The buffer is the caller's and is already zeroed, so the terminator is written by *not* filling the
+// last byte: the copy stops at `name_len - 1` however long the name is.
+private[freertos] write_name(name: string, into: *u8)
+    val n = if name.len < name_len then name.len else name_len - 1
+
+    for i in 0..<n do into[i] = name.bytes[i]
+
+private[freertos] extern "xTaskCreate" c_task_create(body: *extern(*u8) -> unit, name: *u8,
+                                                     depth: usize, arg: *u8, priority: usize,
+                                                     into: **TaskControlBlock) -> isize
+
+private[freertos] extern "xTaskCreateStatic" c_task_create_static(body: *extern(*u8) -> unit,
+                                                                  name: *u8, depth: usize, arg: *u8,
+                                                                  priority: usize, stack: *usize,
+                                                                  tcb: *u8) -> *TaskControlBlock
+
+private[freertos] extern "vTaskDelete" c_task_delete(t: *TaskControlBlock)
+private[freertos] extern "vTaskSuspend" c_task_suspend(t: *TaskControlBlock)
+private[freertos] extern "vTaskResume" c_task_resume(t: *TaskControlBlock)
+private[freertos] extern "vTaskDelay" c_task_delay(ticks: usize)
+private[freertos] extern "xTaskDelayUntil" c_task_delay_until(last: *usize, interval: usize) -> isize
+private[freertos] extern "uxTaskPriorityGet" c_task_priority(t: *TaskControlBlock) -> usize
+private[freertos] extern "uxTaskBasePriorityGet" c_task_base_priority(t: *TaskControlBlock) -> usize
+private[freertos] extern "vTaskPrioritySet" c_task_set_priority(t: *TaskControlBlock, priority: usize)
+private[freertos] extern "eTaskGetState" c_task_state(t: *TaskControlBlock) -> isize
+private[freertos] extern "uxTaskGetStackHighWaterMark" c_task_high_water(t: *TaskControlBlock) -> usize
+private[freertos] extern "xTaskGetCurrentTaskHandle" c_current_task() -> *TaskControlBlock
+
+private[freertos] extern "xTaskGenericNotify" c_notify(t: *TaskControlBlock, index: usize, value: u32,
+                                                       action: isize, previous: *u32) -> isize
+
+private[freertos] extern "ulTaskGenericNotifyTake" c_notify_take(index: usize, clear: isize,
+                                                                 wait: usize) -> u32
+
+private[freertos] extern "xTaskGenericNotifyWait" c_notify_wait(index: usize, on_entry: u32,
+                                                                on_exit: u32, value: *u32,
+                                                                wait: usize) -> isize

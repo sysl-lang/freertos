@@ -1,0 +1,92 @@
+// FreeRTOS for sysl -- tasks, queues, semaphores, mutexes and the tick.
+//
+// This is the block a *consumer* writes to reach this package:
+//
+//     dependencies {
+//       freertos { git = "github.com/sysl-lang/freertos", version = "0.1.0" }
+//     }
+//
+// The coordinate is identity rather than a URL, so it carries no `https://`, and the version is a
+// tag `v0.1.0` on this repository. `--lib` still works and is what a checkout beside you is for.
+
+// `name` is the package; the module a program imports is `sh.sysl.freertos`, and the two are
+// deliberately different. The module carries the `sh.sysl.` prefix so that no package claims a
+// top-level word another one might want; the package name is the short one, because it names this
+// repository rather than a namespace.
+
+package {
+  name    = "freertos"
+  version = "0.1.0"
+}
+
+// **This package declares and does not implement.** There is no kernel source here, no port, no
+// `FreeRTOSConfig.h`, and no `.c` file of any kind: every name below is a symbol the kernel you
+// built already has.
+//
+// That is not a shortcut, it is the only shape that works. `FreeRTOSConfig.h` is ABI --
+// `configUSE_16_BIT_TICKS` moves `TickType_t` between 16 and 32 bits, and
+// `configMAX_TASK_NAME_LEN` and the static-allocation switches move the layout of every
+// `Static*_t` -- *and it is the application's file*, not the kernel's and not this package's. A
+// vendored kernel would have to be compiled against your config, which means either reaching a
+// path on your machine from this committed file (`15 §8` refuses that, in as many words) or fixing
+// a config here and making the package useless on any board whose author wants a different tick
+// rate.
+//
+// So you build the kernel -- your config, your port -- and sysl compiles this against the same
+// headers and links what you built. `pico2` has the same shape and the same reason.
+//
+// What keeps it honest is `c const`: every size, every macro constant and the tick width are
+// measured out of *your* headers on every build, by the C compiler, rather than transcribed here.
+// See `README.md` for what happens when they disagree with what this package assumes -- an
+// `@assert` refuses the build rather than a program misreading a struct at run time.
+
+requires {
+
+  // Three, because a consumer knows three separate things and no one of them can be derived from
+  // another. A named include path is one directory, so a repeated name would overwrite rather than
+  // accumulate.
+  // A triple-quoted HOCON string is raw, so a '\' at the end of a line stays in the text and turns up
+  // in the diagnostic. These are one line each for that reason, however long the line is.
+  headers {
+    freertos = "the FreeRTOS kernel's own 'include' directory -- clone github.com/FreeRTOS/FreeRTOS-Kernel and it is 'include' at the top"
+
+    freertos-port = "the portable directory for the port you chose, the one holding 'portmacro.h' -- 'portable/GCC/ARM_CM4F' for a Cortex-M4F, 'portable/ThirdParty/GCC/Posix' to run on a POSIX host"
+
+    freertos-config = "the directory holding YOUR 'FreeRTOSConfig.h' -- it is the application's file rather than the kernel's, which is why this package cannot supply it"
+  }
+}
+
+// **The heap is FreeRTOS's**, which is what `packages.md § 13` is for. Every allocation the whole
+// program emits -- a string concatenation, a `Buf` growing, a box the reference counter builds --
+// goes to `pvPortMalloc`, and every release to `vPortFree`.
+//
+// It has to, because a program has one heap. On a bare target libc's `malloc` is either absent or
+// not safe to call from two tasks, while `heap_4.c` suspends the scheduler around every allocation;
+// and a mixed pair would link cleanly and hand one allocator's storage to the other's `free` at run
+// time, which is the failure this block exists to prevent.
+//
+// **The cost, stated rather than hidden:** an application built with
+// `configSUPPORT_DYNAMIC_ALLOCATION 0` has no `pvPortMalloc` to link against, so a program that
+// allocates will not link. That is the right answer for a fully static application, and `@no_alloc`
+// is how such a program says so up front -- a program that allocates nothing does not reference the
+// pair at all, so naming it here costs that application nothing.
+allocator {
+  alloc = "pvPortMalloc"
+  free  = "vPortFree"
+}
+
+// **There is deliberately no capability under `requires`.** The tempting one is `threads`, and it
+// is wrong twice over: `capabilities.md` makes it a property the *target* offers, gating
+// `sysl.thread` specifically, and a package cannot make its target offer one. Declaring it would
+// refuse this package on precisely the freestanding targets it exists for.
+//
+// Nothing else fits either. This package opens no file, reads no clock and asks an operating system
+// for nothing -- the kernel it binds *is* the thing that would have provided those. `heap` is not
+// declared for the same reason the block above exists: the heap is named rather than assumed.
+//
+// What a reader does need to know is that `06`'s crossing rules are language rules and bind a
+// FreeRTOS task exactly as they bind anything else that creates a domain. A plain `&T` may not
+// cross into a task -- its count is not atomic, which is the race the whole model exists to
+// prevent. `&sync T` is the spelling that may, and `sysl.sync`'s `Atomic` and `SpinLock` need no
+// capability and are already reachable on a bare machine. README.md says this at length, because it
+// is the one thing here that a person can get wrong quietly.

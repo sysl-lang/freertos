@@ -1,0 +1,151 @@
+module sh.sysl.freertos
+
+@link("freertos")
+@include("FreeRTOS.h")
+@include("task.h")
+@include("queue.h")
+
+// FreeRTOS for sysl -- the scheduler, the tick, and the critical section.
+//
+// Nothing in this package is implemented here: every name below is a symbol the kernel *you* built
+// already exports, and every number is measured out of *your* headers by the C compiler. See
+// `package.hocon` for why it has to be that way -- `FreeRTOSConfig.h` is ABI and it is the
+// application's file, so a package that vendored the kernel could only work for one config.
+//
+// The tick is the unit almost everything here is written in, so it comes first. A tick is whatever
+// `configTICK_RATE_HZ` says it is: `ticks(100)` converts milliseconds where a duration is what you
+// have, and `forever` is the block-until-it-happens answer.
+
+// What the kernel measures itself in, read from the config that built it.
+//
+// `forever` is `portMAX_DELAY`, and it means *block* rather than *wait a very long time*: the kernel
+// tests for exactly this value and suspends indefinitely, so it is not the same as passing the
+// largest tick count you can spell.
+c const
+    tick_rate: usize      = "configTICK_RATE_HZ"
+    max_priorities: usize = "configMAX_PRIORITIES"
+    min_stack: usize      = "configMINIMAL_STACK_SIZE"
+    forever: usize        = "portMAX_DELAY"
+
+// The kernel's own integer widths, and the sizes of the storage a static object needs.
+//
+// **These are not decoration -- they are the check that this binding matches the kernel it is being
+// compiled against.** `TickType_t`, `BaseType_t` and `StackType_t` are all config- and
+// port-dependent: the tick is 16 bits under `configUSE_16_BIT_TICKS`, 32 on a Cortex-M and 64 on
+// the POSIX port. Every signature below spells them `usize`/`isize`, which is right for every
+// configuration sysl has a target for, and the `@assert`s underneath are what turn
+// *right-for-every-config-we-know* into a refusal on the one we did not.
+private[freertos] c const
+    tick_bytes: usize   = "sizeof(TickType_t)"
+    base_bytes: usize   = "sizeof(BaseType_t)"
+    ubase_bytes: usize  = "sizeof(UBaseType_t)"
+    stack_bytes: usize  = "sizeof(StackType_t)"
+
+    // The largest stack depth `xTaskCreate` can be given. `configSTACK_DEPTH_TYPE` defaults to
+    // `uint16_t`, so a depth of 100,000 words silently becomes 34,464 on a default config -- which
+    // is why `task` checks against this rather than passing whatever it was handed.
+    stack_depth_max: usize = "(configSTACK_DEPTH_TYPE) -1"
+
+// A tick that is not the width of a machine word would make every signature here wrong in a way
+// that links: the caller would pass 64 bits and the kernel read 32, and a timeout would come out as
+// whatever happened to be in the other half.
+@assert(sizeof(usize) == tick_bytes,
+        "TickType_t is not the width of a machine word on this configuration — sh.sysl.freertos spells every tick count 'usize', so it cannot bind this kernel. configUSE_16_BIT_TICKS is the usual cause")
+
+@assert(sizeof(usize) == base_bytes,
+        "BaseType_t is not the width of a machine word on this configuration — sh.sysl.freertos spells every kernel status 'isize', so it cannot bind this kernel")
+
+@assert(sizeof(usize) == ubase_bytes,
+        "UBaseType_t is not the width of a machine word on this configuration — sh.sysl.freertos spells every priority and count 'usize', so it cannot bind this kernel")
+
+// What the kernel answers with. `pdPASS` and `pdTRUE` are both 1 and `pdFAIL` and `pdFALSE` both 0,
+// but they are four names in the headers because they answer four different questions, and reading
+// them out separately means a kernel that ever changed one would be caught here rather than
+// silently agreeing.
+private[freertos] c const
+    pass: isize  = "pdPASS"
+    yes: isize   = "pdTRUE"
+
+/** How many ticks a duration in milliseconds is, which is what `pdMS_TO_TICKS` does.
+ *
+ * A macro cannot be bound, and this one does not need to be: it is arithmetic over
+ * `configTICK_RATE_HZ`, which `c const` has above. The rounding is the kernel's own -- towards zero
+ * -- so `ticks(0)` is no wait at all and a duration shorter than a tick is too.
+ */
+ticks(ms: usize) -> usize = (ms * tick_rate) / 1000
+
+/** Hand the processor to the scheduler, which does not give it back.
+ *
+ * Every task must be created before this is called; the idle task and, where `configUSE_TIMERS` is
+ * on, the timer task are created by this call. It returns only if there was not enough heap for
+ * those, which on a static build cannot happen and on a dynamic one means `configTOTAL_HEAP_SIZE`
+ * is too small -- so a program that reaches the line after it has a bug rather than a shutdown.
+ */
+start() = c_start_scheduler()
+
+/** The tick count since `start`, which wraps.
+ *
+ * It wraps at `sizeof(usize)` bytes and the kernel does not notice, so a deadline is compared by
+ * subtraction rather than by ordering: `now - then >= interval` is right across a wrap and
+ * `now >= deadline` is not. `Task.delay_until` is the version of that argument you do not have to
+ * make yourself.
+ */
+tick_count() -> usize = c_tick_count()
+
+/** Stop preemption without disabling interrupts, and let it resume.
+ *
+ * This is `vTaskSuspendAll` / `xTaskResumeAll`, and it is the cheaper of the two ways to make a
+ * sequence atomic against *other tasks*: interrupts still run, so it protects nothing against an
+ * ISR. It nests. `resume_all` answers whether a context switch was pending while it was suspended,
+ * which almost nothing needs to know.
+ *
+ * **Nothing that blocks may be called in between**, which includes every function here taking a
+ * tick count, and includes any allocation, since `pvPortMalloc` suspends the scheduler itself.
+ */
+suspend_all() = c_suspend_all()
+
+resume_all() -> bool = c_resume_all() == yes
+
+/** Disable interrupts on this core, and enable them again.
+ *
+ * `taskENTER_CRITICAL` is a macro but the thing it expands to on every port is a real function, so
+ * unlike `taskYIELD` this one binds directly. It nests: the interrupt state is restored when the
+ * outermost `exit_critical` runs, not the first.
+ *
+ * Keep the region short. Nothing that blocks may be called inside one, and on a port with
+ * configurable interrupt priorities the ISRs above `configMAX_SYSCALL_INTERRUPT_PRIORITY` are still
+ * running, which is the point of them.
+ */
+enter_critical() = c_enter_critical()
+
+exit_critical() = c_exit_critical()
+
+/** How much of `configTOTAL_HEAP_SIZE` is left, and the least there has ever been.
+ *
+ * These read the *kernel's* heap, which -- because this package names `pvPortMalloc` as the
+ * program's allocator -- is also the heap every sysl allocation comes out of. So the low-water mark
+ * is a real answer about the whole program rather than about the kernel's own objects, which is
+ * worth knowing when sizing `configTOTAL_HEAP_SIZE`.
+ *
+ * A `heap_1.c` or `heap_3.c` build does not implement the second one; the kernel will not link
+ * rather than answer wrongly.
+ */
+free_heap() -> usize = c_free_heap()
+
+minimum_ever_free_heap() -> usize = c_min_ever_free_heap()
+
+// The kernel's exported symbols, which is all this file really is. Everything above is either
+// arithmetic or a name a reader would rather see than `vTaskSuspendAll`.
+//
+// The Hungarian prefixes are the kernel's convention and are kept exactly, because these are the
+// names in its documentation and in every answer anybody will find while debugging. What the public
+// functions above buy is that a *program* never has to write one.
+
+private[freertos] extern "vTaskStartScheduler" c_start_scheduler()
+private[freertos] extern "xTaskGetTickCount" c_tick_count() -> usize
+private[freertos] extern "vTaskSuspendAll" c_suspend_all()
+private[freertos] extern "xTaskResumeAll" c_resume_all() -> isize
+private[freertos] extern "vPortEnterCritical" c_enter_critical()
+private[freertos] extern "vPortExitCritical" c_exit_critical()
+private[freertos] extern "xPortGetFreeHeapSize" c_free_heap() -> usize
+private[freertos] extern "xPortGetMinimumEverFreeHeapSize" c_min_ever_free_heap() -> usize

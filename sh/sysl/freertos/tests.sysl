@@ -1,0 +1,525 @@
+module sh.sysl.freertos
+
+@tests
+@include("FreeRTOS.h")
+@include("task.h")
+
+// The binding's own tests, run by `sysl test .` against a kernel you have built.
+//
+// **Not one of these starts the scheduler, and that is the whole design of this file.** `start` never
+// returns, so a test that called it would take the runner with it -- and a test that created tasks and
+// let them run would be timing-dependent besides. What makes a real suite possible anyway is that a
+// FreeRTOS object is fully working *before* the scheduler runs: `xQueueGenericCreate`, every
+// non-blocking send and receive, the counts, the semaphores, `xTaskCreate` and the whole of the task
+// introspection surface all operate on the kernel's own data structures and none of them needs a
+// context switch. A wait of `0` never blocks, which is what keeps every call here bounded.
+//
+// So what is checked is exactly what a binding can get wrong: that a symbol resolves, that an argument
+// is in the right position, that a `c const` measured the number the header meant, and that the
+// discriminator hidden inside a macro was the right one. **Whether the scheduler schedules is
+// FreeRTOS's business, and it has its own tests for that.** The README's example is where preemption
+// is actually exercised, and it is a program rather than a test for the reason above.
+//
+// The one thing to be careful of: these run in one process against one kernel, so a test that created
+// a task and did not delete it would leave it for every test after. Each one cleans up.
+
+// A task body for tests that need a real task to look at. It is never scheduled -- nothing here starts
+// the scheduler -- so what it does is irrelevant; what matters is that it is a `TaskFunction_t` a
+// create call will accept.
+private idle_body(arg: *u8) = delay(forever)
+
+@test
+the_tick_rate_is_what_the_config_said() =
+    // Not a tautology: it is the one number the whole file is calibrated against, and a `c const` that
+    // silently read a different macro would make every duration below wrong by the same factor.
+    assert(tick_rate > 0, "configTICK_RATE_HZ is a positive number of ticks per second")
+
+@test
+milliseconds_become_ticks_at_the_configured_rate() =
+    assert(ticks(1000) == tick_rate, "a second is however many ticks a second is")
+    assert(ticks(0) == 0, "no time is no ticks")
+
+@test
+a_duration_shorter_than_a_tick_rounds_to_none() =
+    // The kernel's own rounding, towards zero. Worth pinning because the alternative -- rounding up so
+    // that a nonzero delay always waits -- is defensible and is *not* what FreeRTOS does, so a caller
+    // who needs at least one tick has to say so.
+    if tick_rate <= 1000 then
+        assert(ticks(1000 / tick_rate - 1) == 0, "less than one tick's worth is no ticks")
+
+@test
+the_static_storage_sizes_are_measured_rather_than_guessed() =
+    // These come out of the kernel's headers through `c const`. A zero would mean the expression did
+    // not measure what it was meant to, and a program would then declare a zero-length array for a
+    // control block and hand the kernel a pointer to nothing.
+    assert(task_words > 0, "a task control block is some whole number of words")
+    assert(queue_words > 0, "a queue control block is some whole number of words")
+    assert(semaphore_words > 0, "a semaphore control block is some whole number of words")
+    assert(min_stack > 0, "configMINIMAL_STACK_SIZE is a real floor")
+    assert(max_priorities > 1, "a scheduler with one priority would have nothing to schedule")
+
+@test
+forever_is_the_kernel_s_own_block_forever() =
+    // `portMAX_DELAY` is a value the kernel tests for rather than a large number it waits out, so this
+    // pins that `c const` read the macro and not, say, a config knob that happened to be nearby.
+    assert(forever > tick_rate, "blocking forever is not a duration anybody would write by accident")
+
+// -- Queues -------------------------------------------------------------------------------------
+
+@test
+a_queue_reports_what_it_was_created_with() =
+    val q = queue(4, sizeof(u32)).expect("a four-slot queue of u32 fits in the test heap")
+
+    assert(q.capacity == 4, "four slots")
+    assert(q.item_size == sizeof(u32), "each holding a u32")
+    assert(q.waiting == 0, "and nothing in it yet")
+    assert(q.spaces == 4, "so all four are free")
+
+    q.delete()
+
+@test
+an_item_sent_comes_back_out() =
+    val q = queue(4, sizeof(u32)).expect("a four-slot queue of u32 fits in the test heap")
+
+    assert(q.send(7u32, 0), "sending into an empty queue does not wait")
+    assert(q.waiting == 1, "and there is one in it")
+
+    var got: u32 = 0
+
+    assert(q.receive(&got, 0), "receiving from a queue holding one does not wait")
+    assert(got == 7, "and it is the value that went in")
+    assert(q.waiting == 0, "which is no longer in the queue")
+
+    q.delete()
+
+@test
+a_queue_is_first_in_first_out_and_the_front_jumps_it() =
+    // The two send positions are `queueSEND_TO_BACK` and `queueSEND_TO_FRONT`, which are macros rather
+    // than symbols -- so this is the test that the `c const` read the right one of the pair. Reversed,
+    // both sends would still succeed and the order would be wrong.
+    val q = queue(4, sizeof(u32)).expect("a four-slot queue of u32 fits in the test heap")
+
+    q.send(1u32, 0)
+    q.send(2u32, 0)
+    q.send_front(99u32, 0)
+
+    var got: u32 = 0
+
+    q.receive(&got, 0)
+    assert(got == 99, "the one sent to the front is first")
+    q.receive(&got, 0)
+    assert(got == 1, "then the rest in the order they were sent")
+    q.receive(&got, 0)
+    assert(got == 2, "all of it")
+
+    q.delete()
+
+@test
+peeking_leaves_the_item_where_it_was() =
+    val q = queue(2, sizeof(u32)).expect("a two-slot queue of u32 fits in the test heap")
+
+    q.send(5u32, 0)
+
+    var got: u32 = 0
+
+    assert(q.peek(&got, 0), "peeking at a queue holding one succeeds")
+    assert(got == 5, "and reads the item")
+    assert(q.waiting == 1, "which is still in the queue")
+
+    q.delete()
+
+@test
+a_full_queue_refuses_rather_than_waiting() =
+    val q = queue(1, sizeof(u32)).expect("a one-slot queue of u32 fits in the test heap")
+
+    assert(q.send(1u32, 0), "the first send fits")
+    assert(!q.send(2u32, 0), "the second has nowhere to go and was told not to wait")
+    assert(q.waiting == 1, "and did not overwrite what was there")
+
+    q.delete()
+
+@test
+an_empty_queue_answers_nothing_rather_than_waiting() =
+    val q = queue(1, sizeof(u32)).expect("a one-slot queue of u32 fits in the test heap")
+
+    var got: u32 = 1
+
+    assert(!q.receive(&got, 0), "there is nothing to receive")
+    assert(got == 1, "and the destination was left alone")
+
+    q.delete()
+
+@test
+overwrite_replaces_the_item_in_a_one_slot_queue() =
+    val q = queue(1, sizeof(u32)).expect("a one-slot queue of u32 fits in the test heap")
+
+    q.send(1u32, 0)
+    assert(q.overwrite(2u32), "overwriting a full one-slot queue succeeds")
+    assert(q.waiting == 1, "and there is still exactly one item")
+
+    var got: u32 = 0
+
+    q.receive(&got, 0)
+    assert(got == 2, "which is the one that overwrote")
+
+    q.delete()
+
+@test
+overwrite_is_refused_on_a_queue_with_more_than_one_slot() =
+    // `queueOVERWRITE` is only defined for a one-slot queue -- the kernel's own `configASSERT` says so
+    // -- so this is refused here rather than passed on to an assertion that may be compiled out.
+    val q = queue(2, sizeof(u32)).expect("a two-slot queue of u32 fits in the test heap")
+
+    assert(!q.overwrite(1u32), "overwrite means nothing where there is more than one slot")
+
+    q.delete()
+
+@test
+an_item_of_the_wrong_size_is_refused_rather_than_copied() =
+    // The check that makes an untyped queue safe to use through generic sends. Without it a `u64` into
+    // a queue of `u32` would have the kernel copy four bytes of an eight-byte value, and a `u16` into
+    // one of `u32` would have it read two bytes past the caller's variable.
+    val q = queue(2, sizeof(u32)).expect("a two-slot queue of u32 fits in the test heap")
+
+    assert(!q.send(7u64, 0), "a u64 is not the size of this queue's slot")
+    assert(!q.send(7u16, 0), "nor is a u16")
+    assert(q.waiting == 0, "and neither of them went in")
+
+    var wide: u64 = 0
+
+    assert(!q.receive(&wide, 0), "and nothing comes out into the wrong width either")
+
+    q.delete()
+
+@test
+a_queue_of_a_struct_copies_the_whole_thing() =
+    // A queue copies, which is what makes it the safe way to move a *value* between tasks. A struct is
+    // the case that says the copy is the struct rather than a pointer to it.
+    val q = queue(2, sizeof(Reading)).expect("a two-slot queue of Reading fits in the test heap")
+
+    assert(q.send(Reading(3, 4000000000u32), 0), "a struct the size of a slot goes in")
+
+    var got = Reading(0, 0)
+
+    assert(q.receive(&got, 0), "and comes back")
+    assert(got.channel == 3, "with its first field")
+    assert(got.value == 4000000000u32, "and its second, which does not fit in an i32")
+
+    q.delete()
+
+@test
+resetting_a_queue_throws_away_what_was_in_it() =
+    val q = queue(4, sizeof(u32)).expect("a four-slot queue of u32 fits in the test heap")
+
+    q.send(1u32, 0)
+    q.send(2u32, 0)
+    q.reset()
+
+    assert(q.waiting == 0, "nothing is left")
+    assert(q.spaces == 4, "and every slot is free again")
+
+    q.delete()
+
+@test
+a_queue_can_be_made_from_storage_the_caller_owns() =
+    // The no-allocator path. `queue_words` is the number this cannot be written without, which is why
+    // it is a `c const` and not a constant somebody transcribed.
+    var slots: [16]u8 = [0; 16]
+    var control: [queue_words]usize = [0; queue_words]
+
+    val q = queue_static(slots[0..<16], control[0..<queue_words], sizeof(u32)).expect("sixteen bytes is four u32 slots")
+
+    assert(q.capacity == 4, "the capacity comes from the storage and the item size")
+    assert(q.send(9u32, 0), "and it works exactly as a heap-allocated one does")
+
+    var got: u32 = 0
+
+    q.receive(&got, 0)
+    assert(got == 9, "including what comes back out")
+
+    q.delete()
+
+@test
+static_storage_too_small_for_a_control_block_is_refused() =
+    var slots: [16]u8 = [0; 16]
+    var control: [1]usize = [0; 1]
+
+    // One word is not a control block on any port -- `queue_words` is 21 on the POSIX port and 20 on a
+    // Cortex-M -- and handing it over would have the kernel write over whatever is next to it.
+    assert(queue_static(slots[0..<16], control[0..<1], sizeof(u32)).is_none(),
+           "a control block that could not fit is refused rather than written into")
+
+@test
+a_zero_item_size_is_refused_rather_than_dividing_by_it() =
+    var slots: [16]u8 = [0; 16]
+    var control: [queue_words]usize = [0; queue_words]
+
+    assert(queue_static(slots[0..<16], control[0..<queue_words], 0).is_none(),
+           "a slot of no bytes has no capacity to compute")
+
+// -- Semaphores and mutexes ---------------------------------------------------------------------
+
+@test
+a_binary_semaphore_starts_empty() =
+    // The kernel's own convention and the one people get wrong: `xSemaphoreCreateBinary` does *not*
+    // hand back something already available, so a task that takes before anybody gives will wait.
+    val s = binary_semaphore().expect("a binary semaphore fits in the test heap")
+
+    assert(s.count == 0, "nothing has been given")
+    assert(!s.take(0), "so taking one finds nothing")
+
+    s.delete()
+
+@test
+a_binary_semaphore_holds_one_and_only_one() =
+    val s = binary_semaphore().expect("a binary semaphore fits in the test heap")
+
+    assert(s.give(), "the first give succeeds")
+    assert(s.count == 1, "and it is available")
+    assert(!s.give(), "the second has nowhere to go — this is what makes it binary")
+    assert(s.count == 1, "and did not raise the count")
+
+    assert(s.take(0), "taking finds the one")
+    assert(!s.take(0), "and there is not a second")
+
+    s.delete()
+
+@test
+a_counting_semaphore_counts() =
+    val s = counting_semaphore(3, 0).expect("a counting semaphore fits in the test heap")
+
+    assert(s.count == 0, "it started at zero, as asked")
+
+    s.give()
+    s.give()
+    assert(s.count == 2, "two gives is two")
+    assert(s.give(), "and the third fits")
+    assert(!s.give(), "but the fourth is past the maximum")
+    assert(s.count == 3, "which is where it stops")
+
+    assert(s.take(0), "and they come back out")
+    assert(s.count == 2, "one at a time")
+
+    s.delete()
+
+@test
+a_counting_semaphore_can_start_full() =
+    // The pool-of-n shape, as against the count-of-events shape above. Both are the same object and the
+    // difference is the initial count, which is the argument this checks reached the right parameter.
+    val s = counting_semaphore(3, 3).expect("a counting semaphore fits in the test heap")
+
+    assert(s.count == 3, "all three are there to be taken")
+    assert(s.take(0) && s.take(0) && s.take(0), "and all three can be")
+    assert(!s.take(0), "and then there are none")
+
+    s.delete()
+
+@test
+a_counting_semaphore_will_not_start_above_its_maximum() =
+    assert(counting_semaphore(2, 3).is_none(), "three of a maximum of two is not a state to start in")
+    assert(counting_semaphore(0, 0).is_none(), "a semaphore of maximum zero has nothing to hold")
+
+@test
+a_mutex_starts_unlocked_and_locks_once() =
+    val m = mutex().expect("a mutex fits in the test heap")
+
+    assert(m.lock(0), "an unlocked mutex is there to be taken")
+    assert(m.unlock(), "and given back")
+
+    m.delete()
+
+@test
+a_recursive_mutex_can_be_locked_twice_by_its_holder() =
+    // The reason `RecursiveMutex` is a separate type. The recursion count lives inside
+    // `xQueueTakeMutexRecursive`, so a plain take of the same mutex would find it unavailable and wait
+    // — against the task that already holds it, which is a deadlock the types here make unwriteable.
+    val m = recursive_mutex().expect("a recursive mutex fits in the test heap")
+
+    assert(m.lock(0), "taken once")
+    assert(m.lock(0), "and again by the same holder")
+    assert(m.unlock(), "given back once")
+    assert(m.unlock(), "and again, which is when it is actually free")
+
+    m.delete()
+
+@test
+a_semaphore_can_be_made_from_storage_the_caller_owns() =
+    var control: [semaphore_words]usize = [0; semaphore_words]
+
+    val s = binary_semaphore_static(control[0..<semaphore_words]).expect("semaphore_words words is a semaphore's control block")
+
+    assert(s.count == 0, "which starts empty exactly as the heap-allocated one does")
+    assert(s.give() && s.take(0), "and works")
+
+    s.delete()
+
+@test
+a_mutex_can_be_made_from_storage_the_caller_owns() =
+    var control: [semaphore_words]usize = [0; semaphore_words]
+
+    val m = mutex_static(control[0..<semaphore_words]).expect("semaphore_words words is a mutex's control block")
+
+    assert(m.lock(0) && m.unlock(), "and it locks")
+
+    m.delete()
+
+@test
+storage_too_small_for_a_semaphore_is_refused() =
+    var control: [1]usize = [0; 1]
+
+    assert(binary_semaphore_static(control[0..<1]).is_none(), "one word is not a control block")
+    assert(mutex_static(control[0..<1]).is_none(), "nor is it a mutex's")
+    assert(counting_semaphore_static(2, 0, control[0..<1]).is_none(), "nor a counting semaphore's")
+    assert(recursive_mutex_static(control[0..<1]).is_none(), "nor a recursive mutex's")
+
+// -- Tasks --------------------------------------------------------------------------------------
+
+@test
+a_created_task_reports_its_priority_and_is_the_current_one() =
+    // Everything here happens before the scheduler runs, which is exactly when a real program creates
+    // its tasks.
+    //
+    // **`Running` is the answer, and it surprised this file's author.** `eTaskGetState` reports
+    // `eRunning` for whichever task is `pxCurrentTCB`, and `prvAddNewTaskToReadyList` sets that to the
+    // first task created -- before any scheduler exists to run it. So `Running` here means *this is the
+    // task the scheduler would resume first*, not that any of its code has executed: nothing has. A
+    // second task created at a priority no higher answers `Ready`, which is what the suspension test
+    // relies on.
+    val t = task("probe", min_stack, 2, &idle_body, null).expect("one minimal task fits in the test heap")
+
+    assert(t.priority == 2, "the priority it was created with")
+    assert(t.base_priority == 2, "which is also its base, holding no mutex")
+    assert(t.state == Running, "and being the first task created, it is the one pxCurrentTCB names")
+
+    val second = task("second", min_stack, 1, &idle_body, null).expect("two minimal tasks fit in the test heap")
+
+    assert(second.state == Ready, "while a later, no-higher-priority task is merely ready")
+
+    second.delete()
+    t.delete()
+end a_created_task_reports_its_priority_and_is_the_current_one
+
+@test
+a_task_s_priority_can_be_changed() =
+    val t = task("probe", min_stack, 2, &idle_body, null).expect("one minimal task fits in the test heap")
+
+    t.set_priority(4)
+    assert(t.priority == 4, "the scheduler's figure moved")
+    assert(t.base_priority == 4, "and so did its base, since nothing raised it")
+
+    t.delete()
+
+@test
+a_suspended_task_says_so() =
+    // **Two tasks, and not by accident.** Before the scheduler runs, `pxCurrentTCB` points at a created
+    // task, and `vTaskSuspend` sets it to `NULL` when every task there is has been suspended --
+    // whereupon `vTaskResume` dereferences it unconditionally, inside
+    // `taskYIELD_ANY_CORE_IF_USING_PREEMPTION`, and the process wedges in `vTaskResume` burning a core.
+    // That is the kernel's own state machine rather than anything this binding does, and the way to
+    // stay out of it is to leave a task unsuspended.
+    //
+    // The anchor's priority is not lower than the suspended task's for the same reason: resuming a task
+    // of higher priority than the current one yields, and there is no scheduler to yield to.
+    val anchor = task("anchor", min_stack, 2, &idle_body, null).expect("two minimal tasks fit in the test heap")
+    val t = task("probe", min_stack, 1, &idle_body, null).expect("two minimal tasks fit in the test heap")
+
+    t.suspend()
+    assert(t.state == Suspended, "suspension is visible")
+    t.resume()
+    assert(t.state == Ready, "and undone")
+
+    t.delete()
+    anchor.delete()
+
+@test
+a_task_that_never_ran_has_used_none_of_its_stack() =
+    // The high-water mark is measured from the fill pattern the kernel writes at creation, so a task
+    // that has not been scheduled should report nearly all of its stack untouched. What this really
+    // pins is that the number is a *word count from the far end* rather than bytes used, which is the
+    // easy thing to get backwards.
+    val t = task("probe", min_stack, 1, &idle_body, null).expect("one minimal task fits in the test heap")
+
+    assert(t.stack_high_water > 0, "an unrun task has never come close to its limit")
+
+    t.delete()
+
+@test
+a_stack_depth_that_would_not_fit_the_config_s_type_is_refused() =
+    // `configSTACK_DEPTH_TYPE` defaults to `uint16_t`, so a depth of 100,000 becomes 34,464 if it is
+    // simply passed on -- a task with a third of the stack it asked for, which runs and then overflows
+    // somewhere unrelated. Refusing is the only answer that reaches the caller.
+    if stack_depth_max < 18446744073709551615 then
+        assert(task("probe", stack_depth_max + 1, 1, &idle_body, null).is_none(),
+               "a depth the kernel's own type cannot carry is refused rather than truncated")
+
+@test
+a_task_can_be_made_from_storage_the_caller_owns() =
+    // The no-heap path, and the one `c const` was needed for: `task_words` is a number only the
+    // kernel's headers know, and an array's length must be a constant.
+    val t = task_static("static", static_stack[0..<512], static_tcb[0..<task_words], 1,
+                        &idle_body, null).expect("512 words and a control block is a task")
+
+    assert(t.state == Running, "a statically created task joins the scheduler's lists like any other")
+    assert(t.priority == 1, "with the priority it was given")
+
+    t.delete()
+
+@test
+static_task_storage_too_small_for_a_control_block_is_refused() =
+    assert(task_static("static", static_stack[0..<512], static_tcb[0..<1], 1, &idle_body,
+                       null).is_none(),
+           "one word is not a control block, and handing it over would have the kernel write past it")
+
+@test
+a_notification_raises_the_target_s_value() =
+    // The notification lives in the task's own control block, so this works with no scheduler: the
+    // give is a write to that block and only the *wait* would need a context switch. `notify_give` is
+    // `eIncrement`, which is the discriminator a macro was hiding.
+    val t = task("probe", min_stack, 1, &idle_body, null).expect("one minimal task fits in the test heap")
+
+    assert(t.notify_give(), "notifying a task that is not waiting still succeeds")
+    assert(t.notify_give(), "and again — there is no queue to fill")
+    assert(t.notify_set_bits(0x0F), "and the bit-field form is the same mechanism")
+
+    t.delete()
+
+@test
+the_heap_reports_a_low_water_mark_no_higher_than_what_is_free() =
+    // Both of these read the kernel's heap, which -- because this package names `pvPortMalloc` as the
+    // program's allocator -- is the heap every sysl allocation comes from too. So this is a claim about
+    // the whole program, and the ordering is the only thing that can be checked without knowing what
+    // else has run.
+    assert(minimum_ever_free_heap() <= free_heap(),
+           "the least there has ever been is not more than there is now")
+
+// A struct the size of a queue slot, for the copying test above. Two fields rather than one so that a
+// binding that copied only the first would be caught.
+private struct Reading
+    channel: u32
+    value: u32
+
+// A statically created task's storage has to outlive the task, so it is module storage rather than a
+// local -- which is the constraint `task_static`'s documentation is about, shown here rather than only
+// described. Two tests share it, and neither leaves a task alive.
+private var static_stack: [512]usize = [0; 512]
+private var static_tcb: [task_words]usize = [0; task_words]
+
+// -- Why there is nothing of the application's in this file ---------------------------------------
+//
+// A FreeRTOS kernel demands things of whoever links it: a `configASSERT` handler, and -- under
+// `configSUPPORT_STATIC_ALLOCATION` -- the idle and timer tasks' storage through
+// `vApplicationGetIdleTaskMemory` and `vApplicationGetTimerTaskMemory`. The test binary is an
+// application, so without them the suite does not link, naming `_vAssertCalled` referenced from
+// `pvPortMalloc` and saying nothing about what wanted it.
+//
+// **They are answered by `test-config/FreeRTOSConfig.h` rather than written here, and that is not
+// tidiness.** An `@export` is one definition of one symbol, and the check is made across the whole
+// program *before* a `@tests` file is dropped -- so three `@export`s here would collide with the three
+// any real application must have, and the diagnostic would name this package as the other definition.
+// Measured, not assumed: it is what stopped the README's own example from compiling.
+//
+// So the config sets `configKERNEL_PROVIDED_STATIC_MEMORY 1`, which has the kernel define its own
+// static storage, and spells `configASSERT` through libc's `assert`. Neither needs a symbol from
+// anybody. A real application on a real board will want the hooks -- README.md shows them -- and this
+// file is the wrong place to demonstrate that, because a demonstration here is a definition
+// everywhere.

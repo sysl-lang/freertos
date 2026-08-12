@@ -1,0 +1,215 @@
+module sh.sysl.freertos
+
+@include("FreeRTOS.h")
+@include("queue.h")
+
+import sysl.slices.as_mut_ptr
+
+// Queues -- how tasks hand each other work.
+//
+// A FreeRTOS queue is a fixed number of fixed-size slots, and **it copies**: `send` copies the item
+// in and `receive` copies it out, so the sender may reuse or drop its own copy the moment the call
+// returns. That is worth stating because it is also what makes a queue the one safe way to move a
+// *value* between tasks -- there is no sharing to reason about, because nothing is shared.
+//
+// **What may not go through one is a reference.** A `&T` is a counted pointer whose count is not
+// atomic, so copying one into another task's hands is the race `06`'s crossing rules exist to
+// prevent -- and the queue would copy the pointer perfectly. Send the value, or send an address and
+// use `&sync T`.
+//
+// The item type is not part of the queue's type, because there is nothing on a `queue(4, ...)` call
+// for a type argument to be inferred from. What the type *is* recovered from is each `send` and
+// `receive`, which are generic and check `sizeof(T)` against the slot size the kernel reports -- so a
+// queue of `u32` handed a `u64` answers `false` rather than writing four bytes past a slot.
+
+// What the kernel calls a queue. Only ever held by pointer.
+opaque struct QueueControl
+
+// One queue. A handle: copying it copies the handle, and there is one queue.
+struct Queue
+    private[freertos] handle: *QueueControl
+
+    /** How many items are in the queue, and how many more will fit.
+     *
+     * Both are answers about a moment that has already passed by the time you read them, unless the
+     * scheduler is stopped or every other task that touches this queue is at a lower priority. Useful
+     * for reporting and for a test; not a basis for deciding whether a `send` will block, which is
+     * what the `wait` argument is for.
+     */
+    waiting -> usize = c_queue_waiting(self.handle)
+
+    spaces -> usize = c_queue_spaces(self.handle)
+
+    /** How big one slot is, in bytes, which is what was asked for at creation.
+     *
+     * This is the kernel's own record rather than a copy kept here, which is why a `Queue` is just a
+     * handle and why one obtained from C behaves identically.
+     */
+    item_size -> usize = c_queue_item_size(self.handle)
+
+    /** How many slots there are.
+     *
+     * Fixed at creation: a FreeRTOS queue does not grow, which is the property that lets it work with
+     * no allocator at all.
+     */
+    capacity -> usize = c_queue_capacity(self.handle)
+
+    /** Copy an item onto the back of the queue, waiting up to `wait` ticks for room.
+     *
+     * `false` means the queue was still full when the wait ran out, or that `T` is not the size of a
+     * slot. `wait` of `0` never blocks and `forever` blocks until there is room.
+     *
+     * **A sending task may block, so this may not be called from an interrupt** -- nor from inside a
+     * critical section, nor with the scheduler suspended, whatever `wait` is.
+     */
+    send[T](self, item: T, wait: usize) -> bool
+        if sizeof(T) != self.item_size then return false
+
+        c_queue_send(self.handle, ptr_cast(&item), wait, send_to_back) == pass
+    end send
+
+    /** Copy an item onto the *front* of the queue, so it is the next one received.
+     *
+     * The queue is otherwise first-in-first-out, so this is a deliberate jump: it is for the message
+     * that has to be seen before what is already waiting, which in practice means an error or a
+     * shutdown.
+     */
+    send_front[T](self, item: T, wait: usize) -> bool
+        if sizeof(T) != self.item_size then return false
+
+        c_queue_send(self.handle, ptr_cast(&item), wait, send_to_front) == pass
+    end send_front
+
+    /** Replace whatever is in a one-slot queue, whether or not it has been read.
+     *
+     * Only for a queue of capacity one, where it is the *latest value* pattern: a producer that would
+     * rather overwrite a stale reading than block or drop the new one. It never waits, because there
+     * is nothing to wait for -- it always has somewhere to put the item.
+     */
+    overwrite[T](self, item: T) -> bool
+        if sizeof(T) != self.item_size || self.capacity != 1 then return false
+
+        c_queue_send(self.handle, ptr_cast(&item), 0, overwrite_slot) == pass
+    end overwrite
+
+    /** Take the front item off the queue, waiting up to `wait` ticks for one to arrive.
+     *
+     * `false` means nothing arrived before the wait ran out, or that `T` is not the size of a slot,
+     * and in either case `into` is not written. The type comes from `into`, so nothing has to be said
+     * twice:
+     *
+     *     var got: u32 = 0
+     *
+     *     if q.receive(&got, forever) then use(got)
+     */
+    receive[T](self, into: *T, wait: usize) -> bool
+        if sizeof(T) != self.item_size then return false
+
+        c_queue_receive(self.handle, ptr_cast(into), wait) == pass
+    end receive
+
+    /** Read the front item without removing it.
+     *
+     * Everything `receive` says applies, except that the item stays where it was -- so two tasks
+     * peeking see the same item, and neither has taken it.
+     */
+    peek[T](self, into: *T, wait: usize) -> bool
+        if sizeof(T) != self.item_size then return false
+
+        c_queue_peek(self.handle, ptr_cast(into), wait) == pass
+    end peek
+
+    /** Throw away everything in the queue.
+     *
+     * Tasks blocked *sending* stay blocked, and the reset does not wake them -- which is the kernel's
+     * behaviour and worth knowing, because a queue emptied underneath a blocked sender is exactly the
+     * moment one would expect to be woken.
+     */
+    reset(self) = c_queue_reset(self.handle)
+
+    /** Free the queue, and whatever the kernel allocated with it.
+     *
+     * Nothing may be blocked on it. A statically created queue's storage is yours and is not touched;
+     * what this releases is the kernel's own record of the queue.
+     */
+    delete(self) = c_queue_delete(self.handle)
+end Queue
+
+// How big a statically created queue's control block has to be, in words of `StackType_t`, for the
+// alignment reason `task_static` gives.
+c const
+    queue_words: usize = "(sizeof(StaticQueue_t) + sizeof(StackType_t) - 1) / sizeof(StackType_t)"
+
+// Which end `xQueueGenericSend` puts the item, and the queue flavour `xQueueGenericCreate` makes.
+// Every one of these is a `#define` in `queue.h` rather than a symbol, which is exactly the half of
+// the macro problem `c const` answers: the function is real and only its discriminator was hidden.
+private[freertos] c const
+    send_to_back: isize   = "queueSEND_TO_BACK"
+    send_to_front: isize  = "queueSEND_TO_FRONT"
+    overwrite_slot: isize = "queueOVERWRITE"
+    queue_base: u8        = "queueQUEUE_TYPE_BASE"
+
+/** Create a queue from the kernel's heap, `None` if there is not enough of it.
+ *
+ * `item_size` is the size of one slot in bytes and is what every `send` and `receive` is checked
+ * against, so it is written once as a `sizeof`:
+ *
+ *     val q = queue(4, sizeof(u32))
+ *
+ * A queue of a struct works the same way, since a queue copies: `queue(8, sizeof(Reading))`. What may
+ * not go in one is anything holding a `&T` -- see the note at the top of this file.
+ */
+queue(capacity: usize, item_size: usize) -> Option[Queue]
+    val handle = c_queue_create(capacity, item_size, queue_base)
+
+    if handle == null then None else Some(Queue(handle))
+
+/** Create a queue from storage you own, `None` if the storage was refused.
+ *
+ * `storage` holds the items and must be `capacity * item_size` bytes; `control` is the kernel's own
+ * record of the queue and must be `queue_words` words. Both are kept for as long as the queue lives.
+ *
+ *     var slots: [4 * 4]u8 = [0; 16]
+ *     var control: [queue_words]usize = [0; queue_words]
+ *
+ *     val q = queue_static(slots[0..<16], control[0..<queue_words], sizeof(u32))
+ *
+ * The capacity is `storage.len / item_size` rather than an argument, because the two would then have
+ * to agree and only one of them can be checked. Needs `configSUPPORT_STATIC_ALLOCATION 1`.
+ */
+queue_static(storage: []u8, control: []usize, item_size: usize) -> Option[Queue]
+    if item_size == 0 || storage.len < item_size || control.len < queue_words then return None
+
+    val handle = c_queue_create_static(storage.len / item_size, item_size, as_mut_ptr(storage),
+                                       ptr_cast(as_mut_ptr(control)), queue_base)
+
+    if handle == null then None else Some(Queue(handle))
+end queue_static
+
+private[freertos] extern "xQueueGenericCreate" c_queue_create(capacity: usize, item_size: usize,
+                                                              kind: u8) -> *QueueControl
+
+private[freertos] extern "xQueueGenericCreateStatic" c_queue_create_static(capacity: usize,
+                                                                          item_size: usize,
+                                                                          storage: *u8,
+                                                                          control: *u8,
+                                                                          kind: u8) -> *QueueControl
+
+private[freertos] extern "xQueueGenericSend" c_queue_send(q: *QueueControl, item: *u8, wait: usize,
+                                                          position: isize) -> isize
+
+private[freertos] extern "xQueueReceive" c_queue_receive(q: *QueueControl, into: *u8,
+                                                         wait: usize) -> isize
+
+private[freertos] extern "xQueuePeek" c_queue_peek(q: *QueueControl, into: *u8, wait: usize) -> isize
+private[freertos] extern "uxQueueMessagesWaiting" c_queue_waiting(q: *QueueControl) -> usize
+private[freertos] extern "uxQueueSpacesAvailable" c_queue_spaces(q: *QueueControl) -> usize
+private[freertos] extern "uxQueueGetQueueItemSize" c_queue_item_size(q: *QueueControl) -> usize
+private[freertos] extern "uxQueueGetQueueLength" c_queue_capacity(q: *QueueControl) -> usize
+private[freertos] extern "xQueueGenericReset" c_queue_reset_generic(q: *QueueControl,
+                                                                   new_queue: isize) -> isize
+private[freertos] extern "vQueueDelete" c_queue_delete(q: *QueueControl)
+
+// `xQueueReset` is a macro over `xQueueGenericReset` with the second argument fixed, which is the
+// same shape as the send positions above: the function is exported and only the argument was hidden.
+private[freertos] c_queue_reset(q: *QueueControl) = c_queue_reset_generic(q, 0)

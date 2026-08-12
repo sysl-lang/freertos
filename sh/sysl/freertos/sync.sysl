@@ -1,0 +1,230 @@
+module sh.sysl.freertos
+
+@include("FreeRTOS.h")
+@include("queue.h")
+@include("semphr.h")
+
+import sysl.slices.as_mut_ptr
+
+// Semaphores and mutexes.
+//
+// All of these are queues underneath -- `SemaphoreHandle_t` *is* `QueueHandle_t` in the kernel's
+// headers, and a semaphore is a queue of zero-byte items whose count is what matters. That is an
+// implementation detail worth knowing for one reason: it means every one of them is a real exported
+// function under a macro, so nothing here needs a shim.
+//
+// **They are three sysl types rather than one, deliberately.** The kernel makes them one, and getting
+// them confused is a bug that links: a recursive mutex taken with the plain `xQueueSemaphoreTake`
+// deadlocks against itself on the second acquisition, because the recursion count is only kept by the
+// recursive functions. Separate types make that unwriteable rather than a thing to remember.
+//
+// **A mutex is not for an interrupt** -- priority inheritance is meaningless where there is no task
+// to inherit -- and `lock` blocks. A binary semaphore is the right thing for an ISR to give.
+
+// What the kernel calls a semaphore, which is what it calls a queue. Only ever held by pointer.
+opaque struct SemaphoreControl
+
+// A counting or binary semaphore: a number that `give` raises and `take` lowers, and a task that
+// takes one at zero waits.
+struct Semaphore
+    private[freertos] handle: *SemaphoreControl
+
+    /** Take one, waiting up to `wait` ticks for there to be one.
+     *
+     * `false` means the count was still zero when the wait ran out. `0` never blocks and `forever`
+     * blocks until somebody gives.
+     */
+    take(self, wait: usize) -> bool = c_sem_take(self.handle, wait) == pass
+
+    /** Give one back, `false` if the semaphore is already at its maximum.
+     *
+     * A binary semaphore's maximum is one, so giving twice in a row answers `false` the second time
+     * rather than counting to two -- which is the difference between a binary and a counting
+     * semaphore, and the reason to say which you want at creation.
+     */
+    give(self) -> bool = c_sem_give(self.handle, null, 0, sem_send_position) == pass
+
+    /** The count, which for a binary semaphore is 0 or 1.
+     *
+     * `uxSemaphoreGetCount` is a macro over `uxQueueMessagesWaiting`, which is what a semaphore's
+     * count is: the number of zero-byte items in the queue.
+     */
+    count -> usize = c_sem_count(self.handle)
+
+    /** Free it. Nothing may be blocked on it, and static storage is not touched. */
+    delete(self) = c_sem_delete(self.handle)
+end Semaphore
+
+// A mutex: a binary semaphore with an owner and priority inheritance.
+//
+// The owner matters. A mutex may be unlocked only by the task that locked it, and while a
+// higher-priority task waits the kernel raises the holder to that priority so the mutex is released
+// promptly -- which is what makes a mutex rather than a binary semaphore the right thing for guarding
+// data between tasks of different priorities.
+struct Mutex
+    private[freertos] handle: *SemaphoreControl
+
+    /** Take the mutex, waiting up to `wait` ticks. `false` means somebody else still has it.
+     *
+     * Not recursive: a task that locks a mutex it already holds blocks for `wait` and then fails. Use
+     * `RecursiveMutex` if that is the shape of the code.
+     */
+    lock(self, wait: usize) -> bool = c_sem_take(self.handle, wait) == pass
+
+    /** Give it back. `false` if this task is not the holder, which is a bug rather than a condition. */
+    unlock(self) -> bool = c_sem_give(self.handle, null, 0, sem_send_position) == pass
+
+    /** Which task holds it, `None` if nobody does.
+     *
+     * Needs `INCLUDE_xSemaphoreGetMutexHolder 1`. It answers about a moment that has passed unless the
+     * asking task is the holder, so it is for reporting and for a test rather than for a decision.
+     */
+    holder -> Option[Task]
+        val t = c_mutex_holder(self.handle)
+
+        if t == null then None else Some(Task(ptr_cast(t)))
+    end holder
+
+    delete(self) = c_sem_delete(self.handle)
+end Mutex
+
+// A mutex a task may take more than once, giving it back as many times as it took it.
+//
+// The count is kept by the recursive calls themselves, which is why this is a separate type: the
+// plain `take` would not see it and the mutex would deadlock against its own holder.
+struct RecursiveMutex
+    private[freertos] handle: *SemaphoreControl
+
+    /** Take it, or take it again if this task already holds it. */
+    lock(self, wait: usize) -> bool = c_mutex_take_recursive(self.handle, wait) == pass
+
+    /** Give back one acquisition. The mutex is free once as many `unlock`s as `lock`s have run. */
+    unlock(self) -> bool = c_mutex_give_recursive(self.handle) == pass
+
+    delete(self) = c_sem_delete(self.handle)
+end RecursiveMutex
+
+// How big any statically created semaphore or mutex is, in words of `StackType_t`. One number for all
+// four, because the kernel has one `StaticSemaphore_t`.
+c const
+    semaphore_words: usize = "(sizeof(StaticSemaphore_t) + sizeof(StackType_t) - 1) / sizeof(StackType_t)"
+
+// The queue flavours, and the fact that a semaphore's items are zero bytes wide. All `#define`s.
+//
+// `sem_send_position` is `queueSEND_TO_BACK` under another name: `xSemaphoreGive` is
+// `xQueueGenericSend(sem, NULL, 0, queueSEND_TO_BACK)`, and reading it out of `queue.h` here rather
+// than reusing the queue file's constant would be measuring the same macro twice.
+private[freertos] c const
+    sem_item_size: usize    = "semSEMAPHORE_QUEUE_ITEM_LENGTH"
+    binary_kind: u8         = "queueQUEUE_TYPE_BINARY_SEMAPHORE"
+    mutex_kind: u8          = "queueQUEUE_TYPE_MUTEX"
+    recursive_kind: u8      = "queueQUEUE_TYPE_RECURSIVE_MUTEX"
+    sem_send_position: isize = "queueSEND_TO_BACK"
+
+/** A binary semaphore, which starts **empty** -- it must be given before it can be taken.
+ *
+ * The signal-from-an-interrupt primitive, and the cheapest thing that is not a task notification. If
+ * exactly one task waits, `notify_take` costs no object at all and is better.
+ */
+binary_semaphore() -> Option[Semaphore]
+    val h = c_queue_create_sem(1, sem_item_size, binary_kind)
+
+    if h == null then None else Some(Semaphore(h))
+
+/** A binary semaphore in storage you own, `semaphore_words` words of it. Starts empty. */
+binary_semaphore_static(control: []usize) -> Option[Semaphore]
+    if control.len < semaphore_words then return None
+
+    val h = c_queue_create_sem_static(1, sem_item_size, ptr_cast(0usize),
+                                      ptr_cast(as_mut_ptr(control)), binary_kind)
+
+    if h == null then None else Some(Semaphore(h))
+end binary_semaphore_static
+
+/** A counting semaphore holding at most `max`, starting at `initial`.
+ *
+ * `initial` of `max` is a pool of `max` things to be taken; `initial` of `0` is a count of events
+ * that have happened. Needs `configUSE_COUNTING_SEMAPHORES 1`.
+ */
+counting_semaphore(max: usize, initial: usize) -> Option[Semaphore]
+    if max == 0 || initial > max then return None
+
+    val h = c_counting_sem(max, initial)
+
+    if h == null then None else Some(Semaphore(h))
+end counting_semaphore
+
+/** A counting semaphore in storage you own, `semaphore_words` words of it. */
+counting_semaphore_static(max: usize, initial: usize, control: []usize) -> Option[Semaphore]
+    if max == 0 || initial > max || control.len < semaphore_words then return None
+
+    val h = c_counting_sem_static(max, initial, ptr_cast(as_mut_ptr(control)))
+
+    if h == null then None else Some(Semaphore(h))
+end counting_semaphore_static
+
+/** A mutex, which starts **unlocked**. Needs `configUSE_MUTEXES 1`. */
+mutex() -> Option[Mutex]
+    val h = c_create_mutex(mutex_kind)
+
+    if h == null then None else Some(Mutex(h))
+
+/** A mutex in storage you own, `semaphore_words` words of it. Starts unlocked. */
+mutex_static(control: []usize) -> Option[Mutex]
+    if control.len < semaphore_words then return None
+
+    val h = c_create_mutex_static(mutex_kind, ptr_cast(as_mut_ptr(control)))
+
+    if h == null then None else Some(Mutex(h))
+end mutex_static
+
+/** A recursive mutex. Needs `configUSE_RECURSIVE_MUTEXES 1`. */
+recursive_mutex() -> Option[RecursiveMutex]
+    val h = c_create_mutex(recursive_kind)
+
+    if h == null then None else Some(RecursiveMutex(h))
+
+/** A recursive mutex in storage you own, `semaphore_words` words of it. */
+recursive_mutex_static(control: []usize) -> Option[RecursiveMutex]
+    if control.len < semaphore_words then return None
+
+    val h = c_create_mutex_static(recursive_kind, ptr_cast(as_mut_ptr(control)))
+
+    if h == null then None else Some(RecursiveMutex(h))
+end recursive_mutex_static
+
+private[freertos] extern "xQueueGenericCreate" c_queue_create_sem(capacity: usize, item_size: usize,
+                                                                 kind: u8) -> *SemaphoreControl
+
+private[freertos] extern "xQueueGenericCreateStatic" c_queue_create_sem_static(capacity: usize,
+                                                                              item_size: usize,
+                                                                              storage: *u8,
+                                                                              control: *u8,
+                                                                              kind: u8) -> *SemaphoreControl
+
+private[freertos] extern "xQueueCreateCountingSemaphore" c_counting_sem(max: usize,
+                                                                       initial: usize) -> *SemaphoreControl
+
+private[freertos] extern "xQueueCreateCountingSemaphoreStatic" c_counting_sem_static(max: usize,
+                                                                                    initial: usize,
+                                                                                    control: *u8) -> *SemaphoreControl
+
+private[freertos] extern "xQueueCreateMutex" c_create_mutex(kind: u8) -> *SemaphoreControl
+
+private[freertos] extern "xQueueCreateMutexStatic" c_create_mutex_static(kind: u8,
+                                                                        control: *u8) -> *SemaphoreControl
+
+private[freertos] extern "xQueueSemaphoreTake" c_sem_take(s: *SemaphoreControl, wait: usize) -> isize
+
+private[freertos] extern "xQueueGenericSend" c_sem_give(s: *SemaphoreControl, item: *u8, wait: usize,
+                                                        position: isize) -> isize
+
+private[freertos] extern "uxQueueMessagesWaiting" c_sem_count(s: *SemaphoreControl) -> usize
+private[freertos] extern "vQueueDelete" c_sem_delete(s: *SemaphoreControl)
+
+private[freertos] extern "xQueueTakeMutexRecursive" c_mutex_take_recursive(m: *SemaphoreControl,
+                                                                          wait: usize) -> isize
+
+private[freertos] extern "xQueueGiveMutexRecursive" c_mutex_give_recursive(m: *SemaphoreControl) -> isize
+
+private[freertos] extern "xQueueGetMutexHolder" c_mutex_holder(m: *SemaphoreControl) -> *SemaphoreControl
