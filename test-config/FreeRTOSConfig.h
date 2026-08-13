@@ -62,6 +62,12 @@
 #define configSUPPORT_DYNAMIC_ALLOCATION           1
 #define configKERNEL_PROVIDED_STATIC_MEMORY        1
 
+/* Queue sets and pended function calls are each behind their own switch and each is off by default,
+ * so a kernel built without them has no symbol for the binding to reach. They are on here because the
+ * package binds both and its tests have to link. */
+#define configUSE_QUEUE_SETS                       1
+#define INCLUDE_xTimerPendFunctionCall             1
+
 #define configUSE_TIMERS                           1
 #define configTIMER_TASK_PRIORITY                  ( configMAX_PRIORITIES - 1 )
 #define configTIMER_QUEUE_LENGTH                   20

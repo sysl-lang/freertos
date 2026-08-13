@@ -1,0 +1,192 @@
+module sh.sysl.freertos
+
+@include("FreeRTOS.h")
+@include("queue.h")
+
+import sysl.slices.as_mut_ptr
+
+// Queue sets -- blocking on several queues and semaphores at once.
+//
+// Everything else here lets a task wait on **one** thing. A queue set is the answer when it genuinely
+// has to be several: a task that must react to a command queue *and* a shutdown semaphore has no way
+// to wait on both, and polling each with a short timeout is the alternative this replaces.
+//
+// **FreeRTOS's own documentation discourages them, and repeating that here is the honest thing to
+// do.** A set costs a queue of its own, its every send does two sends' worth of work, and the rules
+// below are easy to break quietly. The two alternatives are usually better:
+//
+//   - **one queue of a tagged value** -- a struct with a *kind* field, so the command and the
+//     shutdown arrive by the same route and a `match` sorts them out;
+//   - **a task notification**, where the events are flags rather than data.
+//
+// Reach for a set when the things being waited on are *already* separate objects that other code owns
+// and you cannot change -- which is a real situation, and is why this is bound.
+//
+// **Three rules the kernel does not enforce, and each is a silent failure:**
+//
+//   1. **The set must be at least as long as everything in it put together.** Every send to a member
+//      also writes one entry to the set, so a set of 3 holding two queues of 4 will lose events. There
+//      is no diagnostic; `select` simply stops reporting things that are there.
+//   2. **A member must be empty when it is added**, and `add` refuses it otherwise -- that one the
+//      kernel does check.
+//   3. **A member in a set may only be read after `select` has handed it to you.** Receiving from one
+//      directly leaves the set's own queue holding an entry for data that is gone, and the next
+//      `select` reports a queue that is empty.
+
+// A set is a queue underneath -- `QueueSetHandle_t` and `QueueHandle_t` are one C type -- but it is a
+// separate sysl type because none of a queue's operations mean anything on it.
+opaque struct QueueSetControl
+
+/** Whichever member of the set is ready, as handed over by `select`.
+ *
+ * It has to be asked what it is, because a set holds queues and semaphores together and the kernel
+ * answers with a bare handle. Comparing is how: a program knows which objects it put in.
+ *
+ *     match set.select(forever)
+ *         Some(ready) ->
+ *             if ready.is_queue(commands) then handle(commands)
+ *             else if ready.is_semaphore(shutdown) then stop()
+ *         None -> timed_out()
+ */
+struct Selected
+    private[freertos] handle: *QueueControl
+
+    is_queue(self, q: Queue) -> bool = self.handle == q.handle
+
+    is_semaphore(self, s: Semaphore) -> bool = self.handle == as_member(s.handle)
+
+    /** The member as the thing it is, once you have established which.
+     *
+     * These re-wrap rather than convert -- the handle is the object -- so asking for the wrong one
+     * gives a `Queue` that is really a semaphore, and the kernel will do something unhelpful with it.
+     * Ask `is_queue` first; that is what it is for.
+     */
+    as_queue -> Queue = Queue(self.handle)
+
+    as_semaphore -> Semaphore = Semaphore(as_semaphore_handle(self.handle))
+end Selected
+
+// A queue, a semaphore and a set are one C type -- `struct QueueDefinition *` -- wearing three sysl
+// names, which is what keeps them from being mixed up by accident. These two are where that has to be
+// undone, and they are named functions rather than a bare `ptr_cast` at each site because `ptr_cast`
+// takes its target from what the result is read into, and a comparison says nothing about that.
+private[freertos] as_member(h: *SemaphoreControl) -> *QueueControl = ptr_cast(h)
+private[freertos] as_semaphore_handle(h: *QueueControl) -> *SemaphoreControl = ptr_cast(h)
+private[freertos] as_queue_handle(h: *QueueSetControl) -> *QueueControl = ptr_cast(h)
+
+// One queue set.
+struct QueueSet
+    private[freertos] handle: *QueueSetControl
+
+    /** Put a queue into the set, `false` if it was not empty or is already in one.
+     *
+     * The refusal is the kernel's and it is worth having: adding a queue that already holds items
+     * would leave the set unaware of them, so they could never be selected.
+     */
+    add(self, q: Queue) -> bool = c_set_add(q.handle, self.handle) == pass
+
+    add_semaphore(self, s: Semaphore) -> bool = c_set_add(as_member(s.handle), self.handle) == pass
+
+    /** Take a member out of the set, `false` if it is not in this set or is not empty.
+     *
+     * Emptiness is required for the same reason as on the way in: an item in a member has an entry in
+     * the set, and removing the member would strand it.
+     */
+    remove(self, q: Queue) -> bool = c_set_remove(q.handle, self.handle) == pass
+
+    remove_semaphore(self, s: Semaphore) -> bool =
+        c_set_remove(as_member(s.handle), self.handle) == pass
+
+    /** Block until some member has something, and answer which -- `None` if the wait ran out.
+     *
+     * **This does not read the member; it names it.** The item is still in the queue, and the caller
+     * must then receive from it -- which is guaranteed not to block, because the set said it is there.
+     * That two-step is the whole shape of using a set:
+     *
+     *     match set.select(forever)
+     *         Some(ready) ->
+     *             if ready.is_queue(commands) then
+     *                 var cmd: u32 = 0
+     *
+     *                 ready.as_queue.receive(&cmd, 0)
+     *                 run(cmd)
+     *         None -> ()
+     *
+     * A wait of `0` never blocks and is the poll.
+     */
+    select(self, wait: usize) -> Option[Selected]
+        val handle = c_set_select(self.handle, wait)
+
+        if handle == null then None else Some(Selected(handle))
+    end select
+
+    /** Free the set. Its members are not touched and are yours to delete separately.
+     *
+     * Everything must have been removed first, by the emptiness rule above.
+     */
+    delete(self) = c_queue_delete(as_queue_handle(self.handle))
+end QueueSet
+
+/** Create a queue set from the kernel's heap, `None` if there is not enough of it.
+ *
+ * `capacity` must be at least the sum of the capacities of everything that will go in it -- a set of
+ * two four-slot queues and a binary semaphore is `4 + 4 + 1`. Too small is not refused anywhere and
+ * costs events, which is rule 1 at the top of this file.
+ *
+ *     val set = queue_set(4 + 1).expect("no heap for the set")
+ *
+ *     set.add(commands)
+ *     set.add_semaphore(shutdown)
+ *
+ * Needs `configUSE_QUEUE_SETS 1`, without which the kernel compiles none of this and it does not link.
+ */
+queue_set(capacity: usize) -> Option[QueueSet]
+    if capacity == 0 then return None
+
+    val handle = c_set_create(capacity)
+
+    if handle == null then None else Some(QueueSet(handle))
+end queue_set
+
+/** Create a queue set from storage you own, `None` if the storage was refused.
+ *
+ * A set's items are handles, so `storage` must be `capacity * sizeof(*u8)` bytes -- which is what
+ * `queue_set_slot` is, said once rather than worked out at each call site. `control` is `queue_words`
+ * words, the same control block a queue has, because a set is one.
+ *
+ *     var slots: [5 * queue_set_slot]u8 = [0; 5 * queue_set_slot]
+ *     var control: [queue_words]usize = [0; queue_words]
+ *
+ *     val set = queue_set_static(slots[0..<5 * queue_set_slot], control[0..<queue_words])
+ *
+ * The capacity is `storage.len / queue_set_slot` rather than an argument, for the reason
+ * `queue_static` gives: two numbers that have to agree, of which only one can be checked.
+ */
+queue_set_static(storage: []u8, control: []usize) -> Option[QueueSet]
+    if storage.len < queue_set_slot || control.len < queue_words then return None
+
+    val handle = c_set_create_static(storage.len / queue_set_slot, as_mut_ptr(storage),
+                                     ptr_cast(as_mut_ptr(control)))
+
+    if handle == null then None else Some(QueueSet(handle))
+end queue_set_static
+
+// How many bytes one entry of a set's own queue takes. A set holds handles rather than items, so this
+// is a pointer -- and it is measured rather than assumed because it is what a static set's storage has
+// to be a multiple of.
+c const
+    queue_set_slot: usize = "sizeof(QueueSetMemberHandle_t)"
+
+private[freertos] extern "xQueueCreateSet" c_set_create(capacity: usize) -> *QueueSetControl
+
+private[freertos] extern "xQueueCreateSetStatic" c_set_create_static(
+    capacity: usize, storage: *u8, control: *u8) -> *QueueSetControl
+
+private[freertos] extern "xQueueAddToSet" c_set_add(member: *QueueControl,
+                                                    set: *QueueSetControl) -> isize
+
+private[freertos] extern "xQueueRemoveFromSet" c_set_remove(member: *QueueControl,
+                                                            set: *QueueSetControl) -> isize
+
+private[freertos] extern "xQueueSelectFromSet" c_set_select(set: *QueueSetControl,
+                                                            wait: usize) -> *QueueControl

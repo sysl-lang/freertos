@@ -861,6 +861,108 @@ static_stream_storage_too_small_is_refused() =
     assert(stream_static(static_stream_storage[0..<16], static_stream_control[0..<1], 1).is_none(),
            "and one word is not a control block")
 
+// -- Queue sets -----------------------------------------------------------------------------------
+
+@test
+a_set_names_which_of_its_members_is_ready() =
+    // The whole point of a set in one test: two different kinds of object in it, and the one that was
+    // written to is the one reported. A binding that returned the set's own handle, or the first
+    // member, would pass a test with one member in it -- so there are two.
+    val set = queue_set(4 + 1).expect("a small queue set fits in the test heap")
+    val commands = queue(4, sizeof(u32)).expect("a four-slot queue fits in the test heap")
+    val shutdown = binary_semaphore().expect("a binary semaphore fits in the test heap")
+
+    assert(set.add(commands), "an empty queue joins the set")
+    assert(set.add_semaphore(shutdown), "and so does a semaphore, which is the point of a set")
+
+    assert(set.select(0).is_none(), "nothing has happened, so nothing is ready")
+
+    commands.send(7u32, 0)
+
+    val ready = set.select(0).expect("the queue was written to, so the set has something")
+
+    assert(ready.is_queue(commands), "and it is the queue rather than the semaphore")
+    assert(!ready.is_semaphore(shutdown), "which are told apart by the handle, not by order")
+
+    var got: u32 = 0
+
+    assert(ready.as_queue.receive(&got, 0), "selecting names the member; receiving is still yours to do")
+    assert(got == 7, "and the item is the one that was sent")
+
+    assert(set.remove(commands), "an emptied member leaves the set")
+    assert(set.remove_semaphore(shutdown), "and so does the semaphore")
+
+    set.delete()
+    commands.delete()
+    shutdown.delete()
+
+@test
+a_semaphore_given_is_selected_as_the_semaphore() =
+    // The other half of the discrimination above, so that neither answer is right by accident.
+    val set = queue_set(1).expect("a one-entry queue set fits in the test heap")
+    val shutdown = binary_semaphore().expect("a binary semaphore fits in the test heap")
+
+    assert(set.add_semaphore(shutdown), "the semaphore joins the set")
+
+    shutdown.give()
+
+    val ready = set.select(0).expect("giving the semaphore made it ready")
+
+    assert(ready.is_semaphore(shutdown), "and the set names the semaphore")
+    assert(ready.as_semaphore.take(0), "which is then taken as usual, and does not block")
+
+    assert(set.remove_semaphore(shutdown), "and an emptied semaphore leaves the set")
+
+    set.delete()
+    shutdown.delete()
+
+@test
+a_member_that_is_not_empty_will_not_join_a_set() =
+    // The kernel's own refusal, and worth pinning because the consequence of allowing it is invisible:
+    // the items already in the queue have no entry in the set, so they could never be selected.
+    val set = queue_set(4).expect("a small queue set fits in the test heap")
+    val q = queue(4, sizeof(u32)).expect("a four-slot queue fits in the test heap")
+
+    q.send(1u32, 0)
+
+    assert(!set.add(q), "a queue holding something cannot join")
+
+    var got: u32 = 0
+    q.receive(&got, 0)
+
+    assert(set.add(q), "and emptied, it can")
+    assert(set.remove(q), "which leaves it as it was")
+
+    set.delete()
+    q.delete()
+
+@test
+a_queue_set_can_be_made_from_storage_the_caller_owns() =
+    // A set's slots hold handles rather than items, which is what `queue_set_slot` is for -- a caller
+    // sizing the storage as though it held their own item type would be wrong by a factor.
+    assert(queue_set_slot == sizeof(*u8), "a set's entry is a handle")
+
+    val made = queue_set_static(static_set_storage[0..<2 * queue_set_slot],
+                                static_set_control[0..<queue_words])
+    val set = made.expect("storage for two handles and a control block is what the kernel asked for")
+
+    val q = queue(1, sizeof(u32)).expect("a one-slot queue fits in the test heap")
+
+    assert(set.add(q), "a statically created set is a set like any other")
+    assert(set.remove(q), "and lets its member go again")
+
+    set.delete()
+    q.delete()
+
+@test
+static_queue_set_storage_too_small_is_refused() =
+    assert(queue_set_static(static_set_storage[0..<1], static_set_control[0..<queue_words]).is_none(),
+           "one byte is not room for a handle")
+
+    assert(queue_set_static(static_set_storage[0..<2 * queue_set_slot],
+                            static_set_control[0..<1]).is_none(),
+           "and one word is not a control block")
+
 @test
 the_kernel_calls_a_sysl_callback_with_the_handle_it_was_asked_about() =
     // **This is the test the timer callback's shape rests on**, and it exists because the obvious way
@@ -932,6 +1034,8 @@ private var static_timer_control: [timer_words]usize = [0; timer_words]
 private var static_event_control: [event_words]usize = [0; event_words]
 private var static_stream_control: [stream_words]usize = [0; stream_words]
 private var static_stream_storage: [16]u8 = [0; 16]
+private var static_set_control: [queue_words]usize = [0; queue_words]
+private var static_set_storage: [2 * queue_set_slot]u8 = [0; 2 * queue_set_slot]
 
 // A callback for the tests above. It never runs -- nothing here lets the daemon execute -- so what it
 // does is irrelevant; what matters is that it is a shape `xTimerCreate` will accept.
