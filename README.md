@@ -141,8 +141,7 @@ Add `@assert(sizeof(u32) == sizeof_your_depth_type)` if you would rather find th
 
 And **this package cannot supply these hooks for you**, which is worth saying because it looks like
 exactly the boilerplate a package should absorb. An `@export` is one definition of one symbol, so a
-package carrying them would collide with the application that has to have them — and on sysl 0.0.45 it
-collides even from a `@tests` file that the build then discards.
+package carrying them would collide with the application that has to have them.
 
 ## The heap is FreeRTOS's
 
@@ -222,17 +221,6 @@ sysl test . --link-path /tmp/lib \
   --include-path freertos-port=$P \
   --include-path freertos-config=$C
 ```
-
-> **On sysl 0.0.45 that command cannot work yet**, through no fault of the package: `sysl test` is the
-> one subcommand that does not pass `--include-path` on to a `c const` block's probe compile, so the
-> headers are not found. `run`, `build` and `build-lib` all do. Until a release fixes it, put the same
-> three directories in `CPATH`, which clang reads directly:
->
-> ```bash
-> CPATH="$C:$K/include:$P" sysl test . --link-path /tmp/lib \
->   --include-path freertos=$K/include --include-path freertos-port=$P \
->   --include-path freertos-config=$C
-> ```
 
 ## What is bound, and what is not
 

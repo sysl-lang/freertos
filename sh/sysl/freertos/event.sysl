@@ -1,0 +1,154 @@
+module sh.sysl.freertos
+
+@include("FreeRTOS.h")
+@include("event_groups.h")
+
+import sysl.slices.as_mut_ptr
+
+// Event groups -- waiting for a combination of things to have happened.
+//
+// An event group is a word of bits that any task may set and any task may wait on, and the thing it
+// does that nothing else here does is **wait for more than one**: *go when the sensor has calibrated
+// AND the link is up AND the config has loaded* is one `wait` call, where semaphores would be three
+// waits in an order chosen in advance.
+//
+// **A bit is a fact, not a message.** Setting a bit that is already set does nothing and loses
+// nothing, which is exactly right for *this has happened* and exactly wrong for *here is an item* --
+// two sends into a queue are two items, two sets of a bit are one bit. Use a queue for work and an
+// event group for state.
+//
+// **The top eight bits are the kernel's**, whatever the width of a tick: it keeps the
+// clear-on-exit and wait-for-all flags of blocked waiters in the same word. `event_bits` is how many
+// are left for a program, and asking for one above that is a programming error the kernel catches
+// with `configASSERT` rather than something this binding can report -- see `wait`.
+
+// What the kernel calls an event group. Only ever held by pointer.
+opaque struct EventGroupControl
+
+// One event group. A handle: copying it copies the handle, and there is one group.
+struct Events
+    private[freertos] handle: *EventGroupControl
+
+    /** The bits as they stand, which is `xEventGroupGetBits`.
+     *
+     * A reading of a moment that has already passed unless the scheduler is stopped, exactly as a
+     * queue's `waiting` is. What it is genuinely for is a task that wants to *look* without blocking;
+     * a task that wants to *act* on a combination should `wait` with a timeout of zero, which tests
+     * and clears in one step that no other task can get between.
+     */
+    bits -> usize = c_event_clear(self.handle, 0)
+
+    /** Set bits, and answer the group's value at the moment the setting finished.
+     *
+     * **The answer is not simply the bits you set, and the difference is the point.** Setting a bit
+     * unblocks every waiter it satisfies, and a waiter with `clear_on_exit` clears its bits as it
+     * goes -- all of that happens inside this call, so what comes back is what was left afterwards.
+     * A bit you set and a higher-priority task consumed is already gone from it.
+     *
+     * This may not be called from an interrupt: it walks the waiting list, which is unbounded work.
+     */
+    set(self, bits: usize) -> usize = c_event_set(self.handle, bits)
+
+    /** Clear bits, and answer the group's value as it was *before* the clearing.
+     *
+     * The opposite convention to `set`, and it is the kernel's own: `set` answers after and `clear`
+     * answers before, because in each case that is the value that carries the information. Reading a
+     * bit out of what `clear` returns is how a task takes an event exactly once.
+     */
+    clear(self, bits: usize) -> usize = c_event_clear(self.handle, bits)
+
+    /** Block until some or all of `bits` are set, and answer the group's value at that moment.
+     *
+     * `all` chooses the question: `true` waits for every bit in `bits`, `false` for any one of them.
+     * `clear_on_exit` clears exactly the bits waited for, atomically with the wait ending, which is
+     * what makes a wait-and-consume free of a race with another waiter.
+     *
+     * **There is no separate did-it-time-out answer, and this is the one trap.** What comes back is
+     * the group's value either way, so a timeout is recognised by testing it:
+     *
+     *     val got = ready.wait(sensor | link, true, true, ticks(500))
+     *
+     *     if got & (sensor | link) == sensor | link then go() else timed_out()
+     *
+     * A wait of `0` never blocks and is the test-and-clear operation. A bit above `event_bits` is a
+     * programming error the kernel refuses with `configASSERT`; this binding cannot report it,
+     * because every value of the return type is a legitimate set of bits.
+     */
+    wait(self, bits: usize, clear_on_exit: bool, all: bool, wait: usize) -> usize =
+        c_event_wait(self.handle, bits, if clear_on_exit then yes else 0, if all then yes else 0, wait)
+
+    /** Set bits, then wait for a whole set of them -- a rendezvous no task can slip past.
+     *
+     * This is the barrier: every task sets its own bit and waits for all of them, and none proceeds
+     * until the last arrives. What makes it more than a `set` followed by a `wait` is that the bits
+     * are cleared *for everybody at once* when the condition is met, so a fast task going round the
+     * loop again cannot set its bit for the next round before a slow one has noticed this one.
+     *
+     *     val phase = sync(mine, everyone, forever)
+     *
+     *     if phase & everyone == everyone then all_arrived() else timed_out()
+     *
+     * The answer is read exactly as `wait`'s is, and for the same reason.
+     */
+    sync(self, set: usize, wait_for: usize, wait: usize) -> usize =
+        c_event_sync(self.handle, set, wait_for, wait)
+
+    /** Free the group, and whatever the kernel allocated with it.
+     *
+     * Tasks blocked on it are unblocked with the bits they were waiting for *not* set, so a waiter
+     * that reads the answer correctly reports a timeout rather than proceeding. A statically created
+     * group's storage is yours and is not touched.
+     */
+    delete(self) = c_event_delete(self.handle)
+end Events
+
+// How wide the usable half of the word is, and how big a static group's storage has to be.
+//
+// The kernel keeps the clear-on-exit and wait-for-all flags of blocked waiters in the top **eight**
+// bits of the same word, at every tick width -- so this is 24 on a Cortex-M and 56 on a 64-bit host,
+// and a program that hard-coded either would be wrong on the other.
+c const
+    event_bits: usize  = "(sizeof(EventBits_t) * 8) - 8"
+    event_words: usize = "(sizeof(StaticEventGroup_t) + sizeof(StackType_t) - 1) / sizeof(StackType_t)"
+
+/** Create an event group from the kernel's heap, `None` if there is not enough of it.
+ *
+ *     val ready = events().expect("no heap for an event group")
+ *
+ *     ready.set(sensor)
+ */
+events() -> Option[Events]
+    val handle = c_event_create()
+
+    if handle == null then None else Some(Events(handle))
+
+/** Create an event group from storage you own, `None` if the storage was refused.
+ *
+ * `control` must be `event_words` words and is kept for as long as the group lives -- so module
+ * storage, for the reason `task_static` gives, and words rather than bytes for the alignment reason
+ * it gives too.
+ *
+ * Needs `configSUPPORT_STATIC_ALLOCATION 1`.
+ */
+events_static(control: []usize) -> Option[Events]
+    if control.len < event_words then return None
+
+    val handle = c_event_create_static(ptr_cast(as_mut_ptr(control)))
+
+    if handle == null then None else Some(Events(handle))
+end events_static
+
+private[freertos] extern "xEventGroupCreate" c_event_create() -> *EventGroupControl
+private[freertos] extern "xEventGroupCreateStatic" c_event_create_static(c: *u8) -> *EventGroupControl
+private[freertos] extern "xEventGroupSetBits" c_event_set(g: *EventGroupControl, bits: usize) -> usize
+private[freertos] extern "xEventGroupClearBits" c_event_clear(g: *EventGroupControl,
+                                                              bits: usize) -> usize
+
+private[freertos] extern "xEventGroupWaitBits" c_event_wait(g: *EventGroupControl, bits: usize,
+                                                            clear_on_exit: isize, all: isize,
+                                                            wait: usize) -> usize
+
+private[freertos] extern "xEventGroupSync" c_event_sync(g: *EventGroupControl, set: usize,
+                                                        wait_for: usize, wait: usize) -> usize
+
+private[freertos] extern "vEventGroupDelete" c_event_delete(g: *EventGroupControl)

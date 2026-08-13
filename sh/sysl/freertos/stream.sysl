@@ -1,0 +1,263 @@
+module sh.sysl.freertos
+
+@include("FreeRTOS.h")
+@include("stream_buffer.h")
+
+import sysl.slices.as_ptr
+import sysl.slices.as_mut_ptr
+
+// Stream and message buffers -- bytes between two tasks, without a slot size.
+//
+// A queue moves fixed-size items and copies each one whole. These move **bytes**, which is what a
+// UART, a radio or a log wants: the producer has however many it has, and the consumer takes however
+// many it can hold. They come in two flavours and the difference is the whole of the choice:
+//
+// | | `Stream` | `Messages` |
+// |---|---|---|
+// | what a send is | as many bytes as fit, and it says how many | the whole message or nothing at all |
+// | what a receive gets | up to what you asked for | exactly one message |
+// | boundaries | none -- two sends of 3 bytes read back as 6 | kept -- two sends read back as two |
+// | overhead | none | `sizeof(usize)` bytes per message, for the length |
+//
+// **Both assume ONE writer and ONE reader, and neither enforces it.** That is the trade that makes
+// them faster than a queue: no critical section, just a notification to the other end. Two tasks
+// sending to one buffer will corrupt it, silently, and the fix is a mutex around the send -- or a
+// queue, which does take the lock.
+//
+// **The trigger level is about waking the reader, not about capacity.** A reader blocked on a
+// `Stream` stays blocked until that many bytes are available or its timeout runs out, so a level
+// above one turns a trickle into batches and adds latency on purpose. It means nothing to `Messages`,
+// where a whole message is the trigger.
+
+// What the kernel calls a stream buffer -- a message buffer is the same thing with a flag set, which
+// is why one opaque type serves both.
+opaque struct StreamBufferControl
+
+// A byte stream. A handle: copying it copies the handle, and there is one buffer.
+struct Stream
+    private[freertos] handle: *StreamBufferControl
+
+    /** Copy up to `data.len` bytes in, waiting up to `wait` ticks for room, and answer how many went.
+     *
+     * **A short answer is normal rather than an error**: it means the buffer filled, and the bytes
+     * that did not fit are the caller's to send again. A wait of `0` never blocks and may write none
+     * at all. Sending nothing writes nothing and answers zero.
+     *
+     * A sending task may block, so this may not be called from an interrupt.
+     */
+    send(self, data: []const u8, wait: usize) -> usize
+        if data.len == 0 then return 0
+
+        c_stream_send(self.handle, as_ptr(data), data.len, wait)
+    end send
+
+    /** Copy out up to `into.len` bytes, waiting up to `wait` ticks for the trigger level, and answer
+     * how many were read.
+     *
+     * Zero means the wait ran out with fewer than the trigger level available. Anything else is that
+     * many bytes at the front of `into`, and the rest of `into` is untouched.
+     */
+    receive(self, into: []u8, wait: usize) -> usize
+        if into.len == 0 then return 0
+
+        c_stream_receive(self.handle, as_mut_ptr(into), into.len, wait)
+    end receive
+
+    /** How many bytes are waiting, and how many more will fit.
+     *
+     * Both are readings of a moment that has already passed, exactly as a queue's `waiting` is --
+     * useful for reporting and for deciding how much to try, not for deciding whether a send will
+     * block, which is what `wait` is for.
+     */
+    available -> usize = c_stream_available(self.handle)
+
+    spaces -> usize = c_stream_spaces(self.handle)
+
+    is_empty -> bool = c_stream_is_empty(self.handle) == yes
+    is_full -> bool = c_stream_is_full(self.handle) == yes
+
+    /** Throw away everything in the buffer, `false` if a task is blocked on either end.
+     *
+     * The refusal is the kernel's and it is not a race to be retried around: a reader blocked on a
+     * buffer that was reset underneath it would be waiting for bytes that no longer exist.
+     */
+    reset(self) -> bool = c_stream_reset(self.handle) == pass
+
+    /** How many bytes a blocked reader waits for before it is woken, `false` if above the capacity.
+     *
+     * One is the default and means *wake on anything*. Raising it batches: the reader sleeps until
+     * there is a worthwhile amount or its own timeout expires, which is fewer context switches and
+     * more latency. A level above the buffer's capacity could never be reached, so it is refused.
+     */
+    set_trigger_level(self, bytes: usize) -> bool = c_stream_trigger(self.handle, bytes) == pass
+
+    /** Free the buffer, and whatever the kernel allocated with it.
+     *
+     * Nothing may be blocked on it. A statically created buffer's storage is yours and is not touched.
+     */
+    delete(self) = c_stream_delete(self.handle)
+end Stream
+
+// Discrete messages. The same kernel object as a `Stream` with its boundary-keeping flag set, and a
+// separate sysl type because the two answer a send completely differently -- see the table above.
+struct Messages
+    private[freertos] handle: *StreamBufferControl
+
+    /** Copy a whole message in, waiting up to `wait` ticks for room, and answer whether it went.
+     *
+     * **All or nothing**: `false` means there was not room for the whole of it and *none* of it was
+     * written, which is the difference from a `Stream` and the reason this answers a `bool` rather
+     * than a count. Room means `message.len + sizeof(usize)` bytes, since the length travels with it.
+     *
+     * A zero-length message is refused rather than sent: the kernel cannot distinguish one from an
+     * empty buffer at the receiving end.
+     */
+    send(self, message: []const u8, wait: usize) -> bool
+        if message.len == 0 then return false
+
+        c_stream_send(self.handle, as_ptr(message), message.len, wait) == message.len
+    end send
+
+    /** Copy out one whole message, waiting up to `wait` ticks, and answer its length.
+     *
+     * Zero means the wait ran out -- **or that the next message is longer than `into`**, and those
+     * two are not distinguished, which is the one sharp edge here. The message is left in the buffer
+     * in the second case, so `next_length` before receiving is how a caller tells them apart and how
+     * it sizes a buffer that has to fit whatever arrives.
+     */
+    receive(self, into: []u8, wait: usize) -> usize
+        if into.len == 0 then return 0
+
+        c_stream_receive(self.handle, as_mut_ptr(into), into.len, wait)
+    end receive
+
+    /** The length of the next message, or zero if there is none waiting.
+     *
+     * The answer to *how big a buffer do I need*, and the only way to tell a timeout from a message
+     * that would not fit.
+     */
+    next_length -> usize = c_stream_next_length(self.handle)
+
+    is_empty -> bool = c_stream_is_empty(self.handle) == yes
+    is_full -> bool = c_stream_is_full(self.handle) == yes
+
+    reset(self) -> bool = c_stream_reset(self.handle) == pass
+
+    delete(self) = c_stream_delete(self.handle)
+end Messages
+
+// How big a static buffer's control block has to be, in words of `StackType_t`, and the per-message
+// overhead a message buffer pays to remember where one ends.
+c const
+    stream_words: usize = "(sizeof(StaticStreamBuffer_t) + sizeof(StackType_t) - 1) / sizeof(StackType_t)"
+    message_overhead: usize = "sizeof(size_t)"
+
+// Which flavour `xStreamBufferGenericCreate` makes. Macros rather than symbols, which is the half of
+// the problem `c const` answers -- `xStreamBufferCreate` and `xMessageBufferCreate` are one function
+// with this argument different, and nothing else.
+private[freertos] c const
+    kind_stream: isize   = "sbTYPE_STREAM_BUFFER"
+    kind_messages: isize = "sbTYPE_MESSAGE_BUFFER"
+
+/** Create a byte stream from the kernel's heap, `None` if there is not enough of it.
+ *
+ * `capacity` is how many bytes it holds, exactly. `trigger` is how many a blocked reader waits for
+ * and must be at least one and no more than `capacity`.
+ *
+ *     val s = stream(64, 1).expect("no heap for the stream")
+ *
+ *     s.send("hello".bytes, 0)
+ */
+stream(capacity: usize, trigger: usize) -> Option[Stream]
+    if capacity == 0 || trigger == 0 || trigger > capacity then return None
+
+    val handle = c_stream_create(capacity, trigger, kind_stream, null, null)
+
+    if handle == null then None else Some(Stream(handle))
+end stream
+
+/** Create a byte stream from storage you own, `None` if the storage was refused.
+ *
+ * **The usable capacity is `storage.len - 1`**, not `storage.len`: the kernel keeps one byte to tell
+ * a full buffer from an empty one, and on the static path the storage is exactly what it is given.
+ * The dynamic `stream` above hides this by allocating one more than asked for; here it cannot, so it
+ * is stated rather than surprising somebody at the boundary.
+ *
+ * `control` must be `stream_words` words. Both it and the storage are kept for as long as the buffer
+ * lives. Needs `configSUPPORT_STATIC_ALLOCATION 1`.
+ */
+stream_static(storage: []u8, control: []usize, trigger: usize) -> Option[Stream]
+    if storage.len < 2 || control.len < stream_words then return None
+    if trigger == 0 || trigger > storage.len - 1 then return None
+
+    val handle = c_stream_create_static(storage.len, trigger, kind_stream, as_mut_ptr(storage),
+                                        ptr_cast(as_mut_ptr(control)), null, null)
+
+    if handle == null then None else Some(Stream(handle))
+end stream_static
+
+/** Create a message buffer from the kernel's heap, `None` if there is not enough of it.
+ *
+ * `capacity` is in bytes and each message costs `message_overhead` of them on top of its own length,
+ * so a buffer for four ten-byte messages is `4 * (10 + message_overhead)`.
+ *
+ *     val m = messages(4 * (10 + message_overhead)).expect("no heap for the buffer")
+ *
+ * There is no trigger level: a whole message is what wakes a reader.
+ */
+messages(capacity: usize) -> Option[Messages]
+    if capacity == 0 then return None
+
+    val handle = c_stream_create(capacity, 0, kind_messages, null, null)
+
+    if handle == null then None else Some(Messages(handle))
+end messages
+
+/** Create a message buffer from storage you own, `None` if the storage was refused.
+ *
+ * The usable capacity is `storage.len - 1`, for the reason `stream_static` gives, and each message
+ * costs `message_overhead` bytes out of that.
+ */
+messages_static(storage: []u8, control: []usize) -> Option[Messages]
+    if storage.len < 2 || control.len < stream_words then return None
+
+    val handle = c_stream_create_static(storage.len, 0, kind_messages, as_mut_ptr(storage),
+                                        ptr_cast(as_mut_ptr(control)), null, null)
+
+    if handle == null then None else Some(Messages(handle))
+end messages_static
+
+// The two callback parameters are the send- and receive-completed hooks, which need
+// `configUSE_SB_COMPLETED_CALLBACK` to do anything and are `null` here exactly as `xStreamBufferCreate`
+// leaves them. The signature carries them either way, so passing them costs a build with the feature
+// off nothing.
+private[freertos] extern "xStreamBufferGenericCreate" c_stream_create(
+    capacity: usize, trigger: usize, kind: isize, on_sent: *u8,
+    on_received: *u8) -> *StreamBufferControl
+
+private[freertos] extern "xStreamBufferGenericCreateStatic" c_stream_create_static(
+    capacity: usize, trigger: usize, kind: isize, storage: *u8, control: *u8, on_sent: *u8,
+    on_received: *u8) -> *StreamBufferControl
+
+private[freertos] extern "xStreamBufferSend" c_stream_send(b: *StreamBufferControl, data: *u8,
+                                                           len: usize, wait: usize) -> usize
+
+private[freertos] extern "xStreamBufferReceive" c_stream_receive(b: *StreamBufferControl, into: *u8,
+                                                                 len: usize, wait: usize) -> usize
+
+private[freertos] extern "xStreamBufferBytesAvailable" c_stream_available(
+    b: *StreamBufferControl) -> usize
+
+private[freertos] extern "xStreamBufferSpacesAvailable" c_stream_spaces(
+    b: *StreamBufferControl) -> usize
+
+private[freertos] extern "xStreamBufferNextMessageLengthBytes" c_stream_next_length(
+    b: *StreamBufferControl) -> usize
+
+private[freertos] extern "xStreamBufferIsEmpty" c_stream_is_empty(b: *StreamBufferControl) -> isize
+private[freertos] extern "xStreamBufferIsFull" c_stream_is_full(b: *StreamBufferControl) -> isize
+private[freertos] extern "xStreamBufferReset" c_stream_reset(b: *StreamBufferControl) -> isize
+private[freertos] extern "vStreamBufferDelete" c_stream_delete(b: *StreamBufferControl)
+
+private[freertos] extern "xStreamBufferSetTriggerLevel" c_stream_trigger(b: *StreamBufferControl,
+                                                                        bytes: usize) -> isize

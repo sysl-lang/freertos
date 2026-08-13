@@ -1,0 +1,266 @@
+module sh.sysl.freertos
+
+@include("FreeRTOS.h")
+@include("timers.h")
+
+import sysl.slices.as_mut_ptr
+
+// Software timers -- a callback the kernel runs for you, later.
+//
+// A software timer costs no task and no stack of its own: every timer in the program shares the
+// **timer daemon**, one task the kernel creates during `start` when `configUSE_TIMERS` is on. That is
+// what makes them cheap enough to have dozens of, and it is also the one thing about them that
+// surprises people, so it is worth stating plainly:
+//
+// **A callback runs on the daemon's stack, at the daemon's priority.** It is not an interrupt and it
+// is not a task of yours. Two consequences follow and neither is optional:
+//
+//   - **A callback must not block.** Anything taking a tick count blocks, so a `receive` with a wait,
+//     a `delay`, or taking a mutex that is held all stop *every* timer in the program, not just this
+//     one. Pass `0` or do the work in a task the callback signals.
+//   - **`configTIMER_TASK_PRIORITY` decides when it runs**, not the timer's period. A callback due at
+//     the same moment as a higher-priority task runs after it, so a period is *no sooner than*
+//     rather than *exactly*.
+//
+// **A command is a message to the daemon rather than an action.** `start`, `stop`, `reset`,
+// `set_period` and `delete` each put an entry on the daemon's queue, so `true` means *queued* and the
+// timer's own state has not changed yet -- read back `is_active` immediately after a `start` before
+// the scheduler has run and it still answers `false`. `configTIMER_QUEUE_LENGTH` is how many can be
+// outstanding, and a full queue is what a `false` means when the arguments were good.
+
+// What the kernel calls a timer. Only ever held by pointer -- and unlike the other opaque types here,
+// a program does name this one, because it is what a callback is handed. `timer_of` is how it becomes
+// a `Timer` again.
+opaque struct TimerControl
+
+// One timer. A handle: copying it copies the handle, and there is one timer.
+struct Timer
+    private[freertos] handle: *TimerControl
+
+    /** The period, in ticks, as it stands.
+     *
+     * A `set_period` that has been queued but not yet acted on is not reflected here, for the reason
+     * at the top of the file -- this reads the timer, and the command is still on the daemon's queue.
+     */
+    period -> usize = c_timer_period(self.handle)
+
+    /** The tick count at which this timer next expires.
+     *
+     * Only meaningful while `is_active`; a dormant timer's expiry time is whatever it was left at.
+     * Like every tick count it wraps, so compare by subtraction rather than by ordering.
+     */
+    expiry -> usize = c_timer_expiry(self.handle)
+
+    /** Whether the timer is running -- created-and-started, and not yet expired if it is one-shot.
+     *
+     * A one-shot timer becomes inactive the moment its callback is called; an auto-reload timer stays
+     * active until it is stopped or deleted.
+     */
+    is_active -> bool = c_timer_is_active(self.handle) == yes
+
+    /** Whether the timer restarts itself after each expiry.
+     *
+     * Fixed at creation and changeable afterwards. `false` is a one-shot: it runs its callback once
+     * and goes dormant, and `start` is what runs it again.
+     */
+    auto_reload -> bool = c_timer_reload(self.handle) == yes
+
+    set_auto_reload(self, on: bool) = c_timer_set_reload(self.handle, if on then yes else 0)
+
+    /** The pointer handed to `timer` at creation, which the callback reads to know which timer it is.
+     *
+     * This is the whole of how one callback serves several timers, and it is why a callback needs no
+     * captures: the identity is in the timer rather than in the function. Whatever is at that address
+     * is shared with the daemon, so `06`'s crossing rules apply to it exactly as they do to a task's
+     * argument -- a plain `&T` may not go here.
+     */
+    id -> *u8 = c_timer_id(self.handle)
+
+    set_id(self, id: *u8) = c_timer_set_id(self.handle, id)
+
+    /** Start the timer, or restart one that is already running, counting from now.
+     *
+     * `wait` is how long to wait for room on the *daemon's queue*, not for the timer -- so `0` is the
+     * right answer almost always, and `false` means the queue was full rather than anything about the
+     * timer. Starting an already-running timer is `reset`.
+     */
+    start(self, wait: usize) -> bool =
+        c_timer_command(self.handle, cmd_start, c_tick_count(), null, wait) == pass
+
+    /** Stop the timer, leaving it dormant. Starting it again begins a fresh period.
+     */
+    stop(self, wait: usize) -> bool = c_timer_command(self.handle, cmd_stop, 0, null, wait) == pass
+
+    /** Begin the period again from now, whether or not the timer was running.
+     *
+     * The debounce operation: reset on every event and the callback runs once, one period after the
+     * last of them. A reset on a dormant timer starts it.
+     */
+    reset(self, wait: usize) -> bool =
+        c_timer_command(self.handle, cmd_reset, c_tick_count(), null, wait) == pass
+
+    /** Change the period, in ticks, and start the timer counting the new one from now.
+     *
+     * The kernel starts the timer as part of this, whether or not it was running -- there is no
+     * change-the-period-but-leave-it-dormant command, and a `stop` afterwards is the way to that.
+     * A period of zero is refused by the kernel's own `configASSERT`.
+     */
+    set_period(self, period: usize, wait: usize) -> bool =
+        c_timer_command(self.handle, cmd_change_period, period, null, wait) == pass
+
+    /** Delete the timer, freeing what the kernel allocated for it.
+     *
+     * The daemon does the freeing when it reaches the command, so the handle is stale from the moment
+     * this is queued rather than from the moment it returns. A statically created timer's storage is
+     * yours and is not touched.
+     */
+    delete(self, wait: usize) -> bool =
+        c_timer_command(self.handle, cmd_delete, 0, null, wait) == pass
+end Timer
+
+/** The `Timer` for a handle, which is what a callback does with the one it is given.
+ *
+ * A callback is a C function pointer and receives the kernel's bare `TimerHandle_t`, because **a sysl
+ * function whose parameter is an aggregate has no address C can call** -- an aggregate crosses to C in
+ * whichever registers that machine's convention names, which are not the ones a sysl call uses, and
+ * the compiler refuses to take the address rather than letting it go wrong on the board. So the
+ * callback takes the pointer and this turns it back into something with methods on it:
+ *
+ *     tick(handle: *TimerControl)
+ *         val t = timer_of(handle)
+ *
+ *         if t.id == ptr_cast(&red) then blink_red() else blink_green()
+ *
+ * It is not a conversion so much as a re-wrapping: a `Timer` is exactly that pointer.
+ */
+timer_of(handle: *TimerControl) -> Timer = Timer(handle)
+
+// How big a statically created timer's control block has to be, in words of `StackType_t`, for the
+// alignment reason `task_static` gives.
+c const
+    timer_words: usize = "(sizeof(StaticTimer_t) + sizeof(StackType_t) - 1) / sizeof(StackType_t)"
+
+    // How many commands may be outstanding at once, which is `configTIMER_QUEUE_LENGTH`.
+    //
+    // Worth having a name for, because it is the answer to *why did `start` return `false` when the
+    // arguments were fine* -- the daemon had not drained the queue. A program issuing commands faster
+    // than the daemon runs is either raising `configTIMER_QUEUE_LENGTH` or has the daemon's priority
+    // too low.
+    timer_queue_length: usize = "configTIMER_QUEUE_LENGTH"
+
+    // The priority the daemon is created at, and so the priority every callback in the program runs
+    // at. A callback cannot preempt a task above this, and a task below it cannot preempt a callback.
+    timer_task_priority: usize = "configTIMER_TASK_PRIORITY"
+
+// The commands the daemon understands. Every one is a `#define` in `timers.h` and the function that
+// carries them is real, which is the shape `c const` exists for -- `xTimerStart` and the rest are
+// macros over `xTimerGenericCommand` with the command number filled in, and nothing else.
+private[freertos] c const
+    cmd_start: isize         = "tmrCOMMAND_START"
+    cmd_stop: isize          = "tmrCOMMAND_STOP"
+    cmd_reset: isize         = "tmrCOMMAND_RESET"
+    cmd_change_period: isize = "tmrCOMMAND_CHANGE_PERIOD"
+    cmd_delete: isize        = "tmrCOMMAND_DELETE"
+
+/** Create a timer from the kernel's heap, `None` if there is not enough of it.
+ *
+ * Nothing is running when this returns: a new timer is dormant and `start` is what sets it going.
+ *
+ *     tick(handle: *TimerControl)
+ *         blink()
+ *
+ *     val t = timer("blink", ticks(500), true, null, &tick).expect("no heap for the timer")
+ *
+ *     t.start(0)
+ *
+ * `auto_reload` decides whether it repeats. `id` is handed to the callback through the timer and may
+ * be `null`; the name is copied into the timer's own storage, so nothing here allocates on your
+ * behalf and the string need not outlive the call.
+ *
+ * **The callback is a C function pointer, not a closure** -- the same shape and the same reason as a
+ * task body. What it receives is the handle of the timer that expired, which `timer_of` turns back
+ * into a `Timer`, so one callback can serve several by reading `id`.
+ *
+ * Needs `configUSE_TIMERS 1`, without which the kernel compiles no daemon and this does not link.
+ */
+timer(name: string, period: usize, auto_reload: bool, id: *u8,
+      callback: *extern(*TimerControl) -> unit) -> Option[Timer]
+    var buf: [name_len]u8 = [0; name_len]
+
+    write_name(name, &buf[0])
+
+    val handle = c_timer_create(&buf[0], period, if auto_reload then yes else 0, id, callback)
+
+    if handle == null then None else Some(Timer(handle))
+end timer
+
+/** Create a timer from storage you own, `None` if the storage was refused.
+ *
+ * `control` is the kernel's record of the timer and must be `timer_words` words; it is kept for as
+ * long as the timer lives. Words rather than bytes for the alignment reason `task_static` explains.
+ *
+ *     var control: [timer_words]usize = [0; timer_words]
+ *
+ *     val t = timer_static("blink", ticks(500), true, null, &tick, control[0..<timer_words])
+ *
+ * Needs `configSUPPORT_STATIC_ALLOCATION 1`, and with it a program has timers and no heap at all.
+ */
+timer_static(name: string, period: usize, auto_reload: bool, id: *u8,
+             callback: *extern(*TimerControl) -> unit, control: []usize) -> Option[Timer]
+    if control.len < timer_words then return None
+
+    var buf: [name_len]u8 = [0; name_len]
+
+    write_name(name, &buf[0])
+
+    val handle = c_timer_create_static(&buf[0], period, if auto_reload then yes else 0, id, callback,
+                                       ptr_cast(as_mut_ptr(control)))
+
+    if handle == null then None else Some(Timer(handle))
+end timer_static
+
+/** The daemon itself, for a program that wants to know its priority or raise it.
+ *
+ * Changing its priority changes when *every* callback in the program runs, which is the knob to reach
+ * for when a timer is late -- `configTIMER_TASK_PRIORITY` is where it starts.
+ *
+ * **Do not call this before `start`.** The daemon is created by `start`, and the kernel puts a
+ * `configASSERT` on asking early rather than answering -- so on a build with assertions on, which is
+ * how anybody debugs, this aborts rather than returning `None`. The `Option` is honest about a build
+ * with `configASSERT` compiled out, where the handle is a null pointer and something has to be
+ * returned; it is not an invitation to use this as a has-the-scheduler-started test.
+ */
+timer_daemon() -> Option[Task]
+    val handle = c_timer_daemon()
+
+    if handle == null then None else Some(Task(handle))
+
+// The daemon and its command queue, which `vTaskStartScheduler` calls when `configUSE_TIMERS` is on.
+//
+// Not public: a program gets this by starting the scheduler, and calling it twice creates a second
+// daemon. What it is here for is the package's own tests, which never start a scheduler and still
+// need a queue for a command to land on.
+private[freertos] extern "xTimerCreateTimerTask" c_timer_create_daemon() -> isize
+
+private[freertos] extern "xTimerCreate" c_timer_create(
+    name: *u8, period: usize, auto_reload: isize, id: *u8,
+    callback: *extern(*TimerControl) -> unit) -> *TimerControl
+
+private[freertos] extern "xTimerCreateStatic" c_timer_create_static(
+    name: *u8, period: usize, auto_reload: isize, id: *u8,
+    callback: *extern(*TimerControl) -> unit, control: *u8) -> *TimerControl
+
+private[freertos] extern "xTimerGenericCommandFromTask" c_timer_command(t: *TimerControl,
+                                                                        command: isize,
+                                                                        value: usize,
+                                                                        woken: *isize,
+                                                                        wait: usize) -> isize
+
+private[freertos] extern "xTimerIsTimerActive" c_timer_is_active(t: *TimerControl) -> isize
+private[freertos] extern "xTimerGetPeriod" c_timer_period(t: *TimerControl) -> usize
+private[freertos] extern "xTimerGetExpiryTime" c_timer_expiry(t: *TimerControl) -> usize
+private[freertos] extern "xTimerGetReloadMode" c_timer_reload(t: *TimerControl) -> isize
+private[freertos] extern "vTimerSetReloadMode" c_timer_set_reload(t: *TimerControl, on: isize)
+private[freertos] extern "pvTimerGetTimerID" c_timer_id(t: *TimerControl) -> *u8
+private[freertos] extern "vTimerSetTimerID" c_timer_set_id(t: *TimerControl, id: *u8)
+private[freertos] extern "xTimerGetTimerDaemonTaskHandle" c_timer_daemon() -> *TaskControlBlock
