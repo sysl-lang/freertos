@@ -1,13 +1,14 @@
-// FreeRTOS for sysl -- tasks, queues, semaphores, mutexes and the tick.
+// FreeRTOS for sysl -- the whole kernel surface: tasks, queues, semaphores, timers, event groups,
+// stream buffers, queue sets and the interrupt half.
 //
 // This is the block a *consumer* writes to reach this package:
 //
 //     dependencies {
-//       freertos { git = "github.com/sysl-lang/freertos", version = "0.1.0" }
+//       freertos { git = "github.com/sysl-lang/freertos", version = "0.2.0" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is a
-// tag `v0.1.0` on this repository. `--lib` still works and is what a checkout beside you is for.
+// tag `v0.2.0` on this repository. `--lib` still works and is what a checkout beside you is for.
 
 // `name` is the package; the module a program imports is `sh.sysl.freertos`, and the two are
 // deliberately different. The module carries the `sh.sysl.` prefix so that no package claims a
@@ -16,7 +17,7 @@
 
 package {
   name    = "freertos"
-  version = "0.1.0"
+  version = "0.2.0"
 }
 
 // **This package declares and very nearly does not implement.** There is no kernel source here, no

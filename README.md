@@ -355,7 +355,7 @@ would resume first*, not that any of its code has run.
 
 ```hocon
 dependencies {
-  freertos { git = "github.com/sysl-lang/freertos", version = "0.1.0" }
+  freertos { git = "github.com/sysl-lang/freertos", version = "0.2.0" }
 }
 ```
 
