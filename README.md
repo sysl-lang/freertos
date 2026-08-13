@@ -1,6 +1,7 @@
 # freertos
 
-FreeRTOS for sysl — tasks, queues, semaphores, mutexes and the tick, as a package.
+FreeRTOS for sysl — tasks, queues, semaphores, timers, event groups, stream buffers and the interrupt
+half, as a package that declares the kernel you built rather than carrying one.
 
 Two tasks and a queue, with the scheduler running and preempting. This is a program that has been
 built and run rather than a sketch; its output is `sum = 6, ticks after 3 receives = 41`.
@@ -58,11 +59,15 @@ the same rule a `var` in an entry file is a *local* of that `main`, not module s
 kernel keeps a pointer to belongs in a module too (or is written `static var`, which is the entry
 file's spelling of module storage).
 
-## This package declares, and does not implement
+## This package declares, and very nearly does not implement
 
-**There is no kernel here.** No `tasks.c`, no port, no `FreeRTOSConfig.h`, and no `.c` file of any
-kind — every name it offers is a symbol the kernel *you* built already exports, and every number it
-uses is measured out of *your* headers by the C compiler while it compiles.
+**There is no kernel here.** No `tasks.c`, no port, no `FreeRTOSConfig.h` — every name it offers is a
+symbol the kernel *you* built already exports, and every number it uses is measured out of *your*
+headers by the C compiler while it compiles.
+
+The single exception is four lines: [`yield.c`](#the-one-piece-of-c-and-why-it-exists) wraps
+`portYIELD_FROM_ISR`, which is a macro on every port and so has no symbol to declare. It is compiled
+against your headers like everything else.
 
 That is not a shortcut. `FreeRTOSConfig.h` is ABI: `configUSE_16_BIT_TICKS` moves `TickType_t`
 between 16 and 32 bits, `configMAX_TASK_NAME_LEN` and the static-allocation switches move the layout
@@ -105,6 +110,26 @@ this package fixes, because `@link("freertos")` is what it declares and a `-l` n
 build produces something else, a symlink is the whole of the fix. A consumer going through
 `sysl build-c` links the archive with their own build system instead, and there `@link("freertos")` is
 only printed for them to act on.
+
+### And the config switches for whatever you use
+
+A FreeRTOS kernel compiles only the objects your config asks for, so a name this package offers has no
+symbol behind it unless the switch is on. **Nothing is lost by leaving one off** — an `extern` this
+package declares and your program never calls costs nothing at link time — so this is a list of what to
+turn on when a name will not link, rather than a list of requirements:
+
+| what you use | what it needs |
+|---|---|
+| timers | `configUSE_TIMERS 1`, and `configTIMER_TASK_PRIORITY` / `configTIMER_QUEUE_LENGTH` / `configTIMER_TASK_STACK_DEPTH` |
+| queue sets | `configUSE_QUEUE_SETS 1` |
+| `Events.set_from_isr` | `configUSE_TIMERS 1` **and** `INCLUDE_xTimerPendFunctionCall 1` — it defers the work to the timer daemon |
+| mutexes, counting semaphores | `configUSE_MUTEXES 1`, `configUSE_RECURSIVE_MUTEXES 1`, `configUSE_COUNTING_SEMAPHORES 1` |
+| task notifications | `configUSE_TASK_NOTIFICATIONS 1` |
+| anything `_static` | `configSUPPORT_STATIC_ALLOCATION 1` |
+| `state`, `suspend`, `delete`, `set_priority`, `stack_high_water`, … | the matching `INCLUDE_` switch, one each |
+
+`test-config/FreeRTOSConfig.h` in this repository turns on everything the suite exercises and is a
+reasonable place to start reading.
 
 ### And whatever your config demands of its application
 
@@ -165,7 +190,10 @@ sysl: allocator: pvPortMalloc / vPortFree (named by freertos)
 Two consequences worth knowing:
 
 - **`free_heap()` is a number about your whole program**, not just about the kernel's objects, which is
-  what makes it useful for sizing `configTOTAL_HEAP_SIZE`.
+  what makes it useful for sizing `configTOTAL_HEAP_SIZE`. That holds when you reach this package by a
+  `dependencies` coordinate. **It does not hold under `--lib`**, where sysl 0.0.46 does not read the
+  declared allocator and your program's own allocations come from libc instead — two heaps, no warning.
+  `sysl … -v` prints which pair was adopted, and is the way to check.
 - **A fully static application still works.** With `configSUPPORT_DYNAMIC_ALLOCATION 0` there is no
   `pvPortMalloc` to link against — and a program that allocates nothing never references it, so nothing
   goes wrong. Use `task_static`, `queue_static` and the `*_static` semaphores, and `@no_alloc` to have
@@ -196,10 +224,16 @@ anything else that creates a domain. Nothing in this package can enforce them fo
 
 ## Building and testing this package
 
-The suite drives the real kernel: it creates queues, semaphores, mutexes and tasks and checks what the
-kernel says about them — 38 tests. **It never starts the scheduler**, because `start` does not return.
-What makes a real suite possible is that every FreeRTOS object works before the scheduler runs, and a
-wait of `0` never blocks.
+The suite drives the real kernel: it creates every object the package binds and checks what the kernel
+says about them — 81 tests, one file per object beside the source it covers. **It never starts the
+scheduler**, because `start` does not return. What makes a real suite possible is that every FreeRTOS
+object works before the scheduler runs, and a wait of `0` never blocks.
+
+Two things that are less obvious. **Each test gets a kernel of its own**, so nothing one leaves behind
+reaches the next — which is what lets a test create the timer daemon or fill its command queue without
+arranging anything for the tests after it, and it is measured rather than assumed. And the `_from_isr`
+tests **call those functions from a task**, which on a real board would be wrong: what is being checked
+is the binding, and the POSIX port has no interrupt priorities to object with.
 
 FreeRTOS's own POSIX port builds and runs on macOS and Linux — there is an explicit `__APPLE__` guard in
 `port.c` — which is what the suite uses. `test-config/FreeRTOSConfig.h` in this repository is the config
@@ -222,12 +256,15 @@ sysl test . --link-path /tmp/lib \
   --include-path freertos-config=$C
 ```
 
-## What is bound, and what is not
+## What is bound
 
-Everything below is a real exported kernel function. **Nothing here needed a shim**, which was not
-obvious in advance: `semphr.h` is 100% macros and `queue.h` is nearly so, but almost every macro
-forwards to an exported `…Generic…` function and hides only a discriminator — which is exactly what
-`c const` supplies.
+**All of it.** Every object FreeRTOS offers, each with a `_static` twin where the kernel has one, and
+the `_from_isr` half of everything that has one.
+
+Everything below is a real exported kernel function. **Only one thing here needed a shim**, which was
+not obvious in advance: `semphr.h` is 100% macros and `queue.h` and `timers.h` are nearly so, but almost
+every macro forwards to an exported `…Generic…` function and hides only a discriminator — which is
+exactly what `c const` supplies.
 
 | | |
 |---|---|
@@ -235,23 +272,67 @@ forwards to an exported `…Generic…` function and hides only a discriminator 
 | tasks | `task`, `task_static`, `current`, `delay`, `delay_until`, `yield_now`, `notify_take`, `notify_wait`, and on a `Task`: `priority`, `base_priority`, `set_priority`, `state`, `stack_high_water`, `suspend`, `resume`, `delete`, `notify_give`, `notify_set_bits` |
 | queues | `queue`, `queue_static`, and on a `Queue`: `send`, `send_front`, `overwrite`, `receive`, `peek`, `waiting`, `spaces`, `capacity`, `item_size`, `reset`, `delete` |
 | semaphores | `binary_semaphore`, `counting_semaphore`, `mutex`, `recursive_mutex`, each with a `_static` twin |
+| timers | `timer`, `timer_static`, `timer_of`, `timer_daemon`, and on a `Timer`: `start`, `stop`, `reset`, `set_period`, `delete`, `period`, `expiry`, `is_active`, `auto_reload`, `set_auto_reload`, `id`, `set_id` |
+| event groups | `events`, `events_static`, and on an `Events`: `bits`, `set`, `clear`, `wait`, `sync`, `delete` |
+| stream buffers | `stream`, `stream_static`, and on a `Stream`: `send`, `receive`, `available`, `spaces`, `is_empty`, `is_full`, `reset`, `set_trigger_level`, `delete` |
+| message buffers | `messages`, `messages_static`, and on a `Messages`: `send`, `receive`, `next_length`, `is_empty`, `is_full`, `reset`, `delete` |
+| queue sets | `queue_set`, `queue_set_static`, and on a `QueueSet`: `add`, `add_semaphore`, `remove`, `remove_semaphore`, `select`, `delete` |
+| interrupts | `yield_from_isr`, `tick_count_from_isr`, and a `_from_isr` on every queue, semaphore, notification, event group and stream operation that has one |
 
 A queue's item type is not part of its type, because there is nothing on a `queue(4, …)` call for a type
 argument to be inferred from. It is recovered instead from each `send` and `receive`, which are generic
 and check `sizeof(T)` against the slot size the kernel reports — so a queue of `u32` handed a `u64`
 answers `false` rather than writing four bytes past a slot.
 
-**Not bound yet**: software timers (`timers.h`), event groups, stream and message buffers, queue sets,
-and the whole `…FromISR` family. The last is the most interesting, because an ISR-safe send takes a
-*woken* out-parameter whose yield is `portYIELD_FROM_ISR` — inline assembly with no symbol, so it is the
-one place this package will eventually need something of the consumer's.
+### The one piece of C, and why it exists
 
-**The port layer is not bound and cannot be.** `portYIELD`, `portYIELD_FROM_ISR`,
-`portDISABLE_INTERRUPTS` and `portENABLE_INTERRUPTS` are inline assembly or intrinsics — per processor,
-and this package compiles no C. `yield_now` is `delay(0)`, which is what `taskYIELD` does from a task and
-is portable; the others are three lines of C beside your own interrupt handler, which is where your
-handler already is. `portENTER_CRITICAL` and `portEXIT_CRITICAL` *are* real functions and are bound, as
-`enter_critical`/`exit_critical`.
+`sh/sysl/freertos/yield.c` is four lines and is the whole of what this package implements:
+
+```c
+void syslFreertosYieldFromISR( BaseType_t xSwitchRequired )
+{
+    portYIELD_FROM_ISR( xSwitchRequired );
+}
+```
+
+`portYIELD_FROM_ISR` is a **macro** on every port, and expands to something different on each: the POSIX
+port calls `vPortYield`, a Cortex-M writes the PendSV bit of the ICSR at `0xE000ED04` and follows it with
+`dsb` and `isb`. There is no symbol to declare and no portable body to write in sysl, so the wrapper is
+compiled against *your* headers — the same three include paths the package already requires — and the
+macro expands to whatever your port needs.
+
+It is worth a translation unit because leaving it out is not a compile error. The `_from_isr` family
+still works; the task the handler woke simply does not run until the next tick, which is a latency bug
+rather than a wrong answer, and an invisible one.
+
+**The rest of the port layer is still not bound and cannot be.** `portDISABLE_INTERRUPTS` and
+`portENABLE_INTERRUPTS` are inline assembly or intrinsics, per processor — three lines of C beside your
+own interrupt handler, which is where your handler already is. `portENTER_CRITICAL` and
+`portEXIT_CRITICAL` *are* real functions and are bound, as `enter_critical`/`exit_critical`; `yield_now`
+is `delay(0)`, which is what `taskYIELD` does from a task.
+
+### Writing an interrupt handler
+
+The flag means *a task that should run before the one you interrupted is now ready*. Accumulate it
+across every kernel call the handler makes, and act on it once, last:
+
+```sysl
+@export("TIM2_IRQHandler")
+on_timer()
+    var woken = false
+
+    readings.send_from_isr(sample(), &woken)
+    ready.set_from_isr(sensor_bit, &woken)
+
+    yield_from_isr(woken)
+```
+
+Passing `false` is free and correct — it means *no task was woken*, not *do not switch* — so a handler
+never has to decide whether to make the call.
+
+**Nothing in a handler may allocate**, whatever this package offers. sysl allocates implicitly — a
+string operation, a `Buf` growing, a box the reference counter builds — and `pvPortMalloc` suspends the
+scheduler. `@no_alloc` on the handler's module is how the compiler holds you to that.
 
 ## One trap the suite found, which is the kernel's rather than this binding's
 
