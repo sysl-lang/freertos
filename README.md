@@ -223,16 +223,9 @@ sysl test . --link-path /tmp/lib \
   --include-path freertos-config=$C
 ```
 
-> **On sysl 0.0.45 that command cannot work yet**, through no fault of the package: `sysl test` is the
-> one subcommand that does not pass `--include-path` on to a `c const` block's probe compile, so the
-> headers are not found. `run`, `build` and `build-lib` all do. Until a release fixes it, put the same
-> three directories in `CPATH`, which clang reads directly:
->
-> ```bash
-> CPATH="$C:$K/include:$P" sysl test . --link-path /tmp/lib \
->   --include-path freertos=$K/include --include-path freertos-port=$P \
->   --include-path freertos-config=$C
-> ```
+> **That needs sysl 0.0.46 or newer.** Before it, `sysl test` was the one subcommand that did not pass
+> `--include-path` on to a `c const` block's probe compile, so the headers were not found and `CPATH`
+> was the way around it. `run`, `build` and `build-lib` were always fine.
 
 ## What is bound, and what is not
 
