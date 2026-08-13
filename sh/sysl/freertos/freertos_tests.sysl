@@ -1,0 +1,53 @@
+module sh.sysl.freertos
+
+@tests
+@include("FreeRTOS.h")
+@include("task.h")
+
+// The scheduler, the tick, and the numbers every other file here is calibrated against.
+
+@test
+the_tick_rate_is_what_the_config_said() =
+    // Not a tautology: it is the one number the whole file is calibrated against, and a `c const` that
+    // silently read a different macro would make every duration below wrong by the same factor.
+    assert(tick_rate > 0, "configTICK_RATE_HZ is a positive number of ticks per second")
+
+@test
+milliseconds_become_ticks_at_the_configured_rate() =
+    assert(ticks(1000) == tick_rate, "a second is however many ticks a second is")
+    assert(ticks(0) == 0, "no time is no ticks")
+
+@test
+a_duration_shorter_than_a_tick_rounds_to_none() =
+    // The kernel's own rounding, towards zero. Worth pinning because the alternative -- rounding up so
+    // that a nonzero delay always waits -- is defensible and is *not* what FreeRTOS does, so a caller
+    // who needs at least one tick has to say so.
+    if tick_rate <= 1000 then
+        assert(ticks(1000 / tick_rate - 1) == 0, "less than one tick's worth is no ticks")
+
+@test
+the_static_storage_sizes_are_measured_rather_than_guessed() =
+    // These come out of the kernel's headers through `c const`. A zero would mean the expression did
+    // not measure what it was meant to, and a program would then declare a zero-length array for a
+    // control block and hand the kernel a pointer to nothing.
+    assert(task_words > 0, "a task control block is some whole number of words")
+    assert(queue_words > 0, "a queue control block is some whole number of words")
+    assert(semaphore_words > 0, "a semaphore control block is some whole number of words")
+    assert(min_stack > 0, "configMINIMAL_STACK_SIZE is a real floor")
+    assert(max_priorities > 1, "a scheduler with one priority would have nothing to schedule")
+
+@test
+forever_is_the_kernel_s_own_block_forever() =
+    // `portMAX_DELAY` is a value the kernel tests for rather than a large number it waits out, so this
+    // pins that `c const` read the macro and not, say, a config knob that happened to be nearby.
+    assert(forever > tick_rate, "blocking forever is not a duration anybody would write by accident")
+
+
+@test
+the_heap_reports_a_low_water_mark_no_higher_than_what_is_free() =
+    // Both of these read the kernel's heap, which -- because this package names `pvPortMalloc` as the
+    // program's allocator -- is the heap every sysl allocation comes from too. So this is a claim about
+    // the whole program, and the ordering is the only thing that can be checked without knowing what
+    // else has run.
+    assert(minimum_ever_free_heap() <= free_heap(),
+           "the least there has ever been is not more than there is now")

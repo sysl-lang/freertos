@@ -1,0 +1,61 @@
+module sh.sysl.freertos
+
+@include("FreeRTOS.h")
+@include("task.h")
+
+// Interrupt handlers -- the `_from_isr` half of the kernel, and the yield that finishes one.
+//
+// **A kernel call from an interrupt is a different function, not the same one used differently.** An
+// ordinary `send` may block, and blocking in a handler would suspend an interrupt rather than a task;
+// the `_from_isr` forms never block and never take the kernel's ordinary locks. Calling the wrong one
+// from a handler is caught by `configASSERT` on the ports that can tell, and is silent corruption on
+// the ports that cannot.
+//
+// **The pattern is: declare a flag, hand it to every call, act on it once.**
+//
+//     @export("TIM2_IRQHandler")
+//     on_timer()
+//         var woken = false
+//
+//         readings.send_from_isr(sample(), &woken)
+//         ready.set_from_isr(sensor_bit, &woken)
+//
+//         yield_from_isr(woken)
+//
+// The flag means *a task that should run before the one you interrupted is now ready*. Without the
+// final call it stays ready and runs at the next tick instead, which is a latency bug rather than a
+// wrong answer -- and an invisible one, which is why every example here ends with the yield.
+//
+// **What may not be done in a handler, whatever this file offers:** anything that allocates. sysl
+// allocates implicitly -- a string operation, a `Buf` growing, a box the reference counter builds --
+// and `pvPortMalloc` suspends the scheduler. `@no_alloc` on the handler's module is how the compiler
+// holds you to that, and it is worth doing.
+
+/** Finish a handler, switching to a higher-priority task if one was woken.
+ *
+ * Called once, last, with the flag every `_from_isr` call in the handler has accumulated. Passing
+ * `false` is free and correct -- it is *no task was woken*, not *do not switch* -- so a handler need
+ * not decide whether to call it.
+ *
+ * **This is the one thing in the package with C behind it**, because `portYIELD_FROM_ISR` is a macro
+ * on every port and there is no symbol to bind. `sh/sysl/freertos/yield.c` says the rest.
+ */
+yield_from_isr(woken: bool) = c_yield_from_isr(if woken then yes else 0)
+
+/** The tick count, read from an interrupt.
+ *
+ * A separate function for the same reason everything else here is: the ordinary `tick_count` may take
+ * a lock on a port where a tick is not read atomically.
+ */
+tick_count_from_isr() -> usize = c_tick_count_from_isr()
+
+// Turn the caller's `bool` into the kernel's `BaseType_t` out-parameter and back again. Every
+// `_from_isr` in this package is written against these two, so that the flag a handler declares is a
+// `bool` rather than an `isize` a reader has to know the encoding of.
+private[freertos] flag_in(woken: *bool) -> isize = if *woken then yes else 0
+
+private[freertos] flag_out(woken: *bool, raw: isize) =
+    if raw == yes then *woken = true
+
+private[freertos] extern "syslFreertosYieldFromISR" c_yield_from_isr(required: isize)
+private[freertos] extern "xTaskGetTickCountFromISR" c_tick_count_from_isr() -> usize

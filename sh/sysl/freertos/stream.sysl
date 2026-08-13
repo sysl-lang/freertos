@@ -91,6 +91,37 @@ struct Stream
      */
     set_trigger_level(self, bytes: usize) -> bool = c_stream_trigger(self.handle, bytes) == pass
 
+    /** Copy bytes in from an interrupt handler, never waiting, and answer how many went.
+     *
+     * **The shape a UART receive handler wants**: take the byte off the peripheral, put it in the
+     * stream, and let a task do the parsing. A short answer means the buffer is filling faster than
+     * the reader empties it, which is the overrun a driver has to notice.
+     */
+    send_from_isr(self, data: []const u8, woken: *bool) -> usize
+        if data.len == 0 then return 0
+
+        var raw = flag_in(woken)
+        val n = c_stream_send_from_isr(self.handle, as_ptr(data), data.len, &raw)
+
+        flag_out(woken, raw)
+        n
+    end send_from_isr
+
+    /** Copy bytes out from an interrupt handler, never waiting, and answer how many were read.
+     *
+     * The transmit half: a handler that has just emptied a peripheral's register takes the next byte
+     * from the stream, and a zero means there is nothing more to send.
+     */
+    receive_from_isr(self, into: []u8, woken: *bool) -> usize
+        if into.len == 0 then return 0
+
+        var raw = flag_in(woken)
+        val n = c_stream_receive_from_isr(self.handle, as_mut_ptr(into), into.len, &raw)
+
+        flag_out(woken, raw)
+        n
+    end receive_from_isr
+
     /** Free the buffer, and whatever the kernel allocated with it.
      *
      * Nothing may be blocked on it. A statically created buffer's storage is yours and is not touched.
@@ -140,6 +171,36 @@ struct Messages
 
     is_empty -> bool = c_stream_is_empty(self.handle) == yes
     is_full -> bool = c_stream_is_full(self.handle) == yes
+
+    /** Send a whole message from an interrupt handler, never waiting.
+     *
+     * All or nothing, exactly as `send` is -- `false` means there was no room for the message and its
+     * length, and none of it was written.
+     */
+    send_from_isr(self, message: []const u8, woken: *bool) -> bool
+        if message.len == 0 then return false
+
+        var raw = flag_in(woken)
+        val n = c_stream_send_from_isr(self.handle, as_ptr(message), message.len, &raw)
+
+        flag_out(woken, raw)
+        n == message.len
+    end send_from_isr
+
+    /** Receive one whole message from an interrupt handler, never waiting.
+     *
+     * Zero means none was waiting or the next one is longer than `into`, undistinguished for the same
+     * reason `receive` gives -- `next_length` is what separates them.
+     */
+    receive_from_isr(self, into: []u8, woken: *bool) -> usize
+        if into.len == 0 then return 0
+
+        var raw = flag_in(woken)
+        val n = c_stream_receive_from_isr(self.handle, as_mut_ptr(into), into.len, &raw)
+
+        flag_out(woken, raw)
+        n
+    end receive_from_isr
 
     reset(self) -> bool = c_stream_reset(self.handle) == pass
 
@@ -258,6 +319,12 @@ private[freertos] extern "xStreamBufferIsEmpty" c_stream_is_empty(b: *StreamBuff
 private[freertos] extern "xStreamBufferIsFull" c_stream_is_full(b: *StreamBufferControl) -> isize
 private[freertos] extern "xStreamBufferReset" c_stream_reset(b: *StreamBufferControl) -> isize
 private[freertos] extern "vStreamBufferDelete" c_stream_delete(b: *StreamBufferControl)
+
+private[freertos] extern "xStreamBufferSendFromISR" c_stream_send_from_isr(
+    b: *StreamBufferControl, data: *u8, len: usize, woken: *isize) -> usize
+
+private[freertos] extern "xStreamBufferReceiveFromISR" c_stream_receive_from_isr(
+    b: *StreamBufferControl, into: *u8, len: usize, woken: *isize) -> usize
 
 private[freertos] extern "xStreamBufferSetTriggerLevel" c_stream_trigger(b: *StreamBufferControl,
                                                                         bytes: usize) -> isize

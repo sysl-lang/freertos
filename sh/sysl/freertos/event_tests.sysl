@@ -1,0 +1,116 @@
+module sh.sysl.freertos
+
+@tests
+@include("FreeRTOS.h")
+@include("task.h")
+
+// Event groups.
+//
+// Every one of these runs with no scheduler because a wait of `0` is a test-and-clear over the
+// kernel's own word, and setting bits with nobody blocked walks an empty waiting list.
+
+@test
+a_new_event_group_has_no_bits_set() =
+    val e = events().expect("an event group fits in the test heap")
+
+    assert(e.bits == 0, "nothing has happened yet")
+    assert(event_bits >= 8, "and there is a usable width to set bits in")
+
+    e.delete()
+
+@test
+a_bit_set_stays_set_and_setting_it_twice_is_the_same_as_once() =
+    // The property that separates an event group from a queue, and the reason to pick between them:
+    // a bit is a fact rather than a message, so it does not accumulate.
+    val e = events().expect("an event group fits in the test heap")
+
+    assert(e.set(0x01) == 0x01, "setting answers the value afterwards")
+    assert(e.set(0x01) == 0x01, "and setting the same bit again changes nothing")
+    assert(e.set(0x02) == 0x03, "a second bit joins the first")
+    assert(e.bits == 0x03, "which is what the group holds")
+
+    e.delete()
+
+@test
+clearing_answers_the_value_from_before_it_cleared() =
+    // The opposite convention to `set`, and the kernel's own. A binding that normalised the two would
+    // be tidier and would throw away the value a caller needs -- what was taken, rather than what is
+    // left.
+    val e = events().expect("an event group fits in the test heap")
+
+    e.set(0x0F)
+
+    assert(e.clear(0x03) == 0x0F, "clear answers what was there before")
+    assert(e.bits == 0x0C, "and what is left is the rest")
+
+    e.delete()
+
+@test
+waiting_for_bits_that_are_already_set_does_not_block() =
+    val e = events().expect("an event group fits in the test heap")
+
+    e.set(0x05)
+
+    assert(e.wait(0x05, false, true, 0) == 0x05, "both bits are there, so waiting for all of them returns")
+    assert(e.bits == 0x05, "and without clear_on_exit they stay set")
+
+    e.delete()
+
+@test
+waiting_with_clear_on_exit_takes_exactly_the_bits_waited_for() =
+    // Atomically with the wait ending, which is what makes wait-and-consume free of a race. Here the
+    // check is narrower and still worth having: the *other* bits are untouched, so a binding that
+    // passed the whole word as the clear mask would be caught.
+    val e = events().expect("an event group fits in the test heap")
+
+    e.set(0x07)
+
+    assert(e.wait(0x01, true, false, 0) == 0x07, "the answer is the value at the moment the wait ended")
+    assert(e.bits == 0x06, "and only the bit waited for was taken")
+
+    e.delete()
+
+@test
+any_and_all_are_different_questions() =
+    // `xWaitForAllBits` is the third argument and a binding that swapped it with `xClearOnExit` would
+    // pass every test above. This is the one that separates them.
+    val e = events().expect("an event group fits in the test heap")
+
+    e.set(0x01)
+
+    assert(e.wait(0x03, false, false, 0) == 0x01, "any of the two is satisfied by the one that is set")
+    assert(e.wait(0x03, false, true, 0) == 0x01,
+           "all of them is not, so this timed out and still answers the value")
+    assert(e.bits == 0x01, "a timed-out wait clears nothing, whatever clear_on_exit said")
+
+    e.delete()
+
+@test
+a_sync_that_nobody_else_joins_times_out_with_its_own_bit_set() =
+    // The rendezvous, run one-sided because a second participant needs a scheduler. What it does check
+    // is that the bits are in the right two arguments: the set happens, the wait is not satisfied, and
+    // the kernel leaves the caller's own bit behind for the others to find.
+    val e = events().expect("an event group fits in the test heap")
+
+    assert(e.sync(0x01, 0x03, 0) == 0x01, "mine is set, theirs is not, so the barrier was not met")
+    assert(e.bits == 0x01, "and mine is still there for them to arrive at")
+
+    e.delete()
+
+@test
+an_event_group_can_be_made_from_storage_the_caller_owns() =
+    val made = events_static(static_event_control[0..<event_words])
+    val e = made.expect("storage of exactly event_words words is what the kernel asked for")
+
+    assert(e.set(0x01) == 0x01, "a statically created group is a group like any other")
+
+    e.delete()
+
+@test
+static_event_group_storage_too_small_is_refused() =
+    assert(events_static(static_event_control[0..<1]).is_none(),
+           "one word is not an event group, and handing it over would have the kernel write past it")
+
+
+// A statically created event group's storage, module storage for the reason a task's stack is.
+private var static_event_control: [event_words]usize = [0; event_words]

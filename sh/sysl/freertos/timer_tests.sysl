@@ -1,0 +1,102 @@
+module sh.sysl.freertos
+
+@tests
+@include("FreeRTOS.h")
+@include("task.h")
+
+// -- Software timers ------------------------------------------------------------------------------
+//
+// A timer's *callback* is the one thing here that genuinely needs the scheduler, because the daemon
+// runs it. What does not need the scheduler is everything else: creation reads the config and fills a
+// control block, the getters read that block, and a command is a queue send. So the tests below cover
+// the binding -- symbols, argument order, the command discriminators a macro was hiding -- and the
+// last one covers the part that looks unreachable, by finding a kernel function that calls a callback
+// synchronously.
+
+@test
+a_created_timer_reports_what_it_was_created_with() =
+    val t = timer("probe", 100, true, null, &probe_tick).expect("one timer fits in the test heap")
+
+    assert(t.period == 100, "the period it was created with, in ticks")
+    assert(t.auto_reload, "and it repeats, because that is what was asked for")
+    assert(!t.is_active, "but nothing is running: a new timer is dormant until it is started")
+    assert(t.id == null, "and its id is the one handed over, which here is none")
+
+    t.delete(0)
+
+@test
+a_timer_s_id_and_reload_mode_can_be_changed() =
+    // The id is how one callback serves several timers, so a binding that dropped it -- or that read
+    // it back from somewhere other than where it was written -- would make that pattern silently
+    // useless rather than fail.
+    val t = timer("probe", 100, false, null, &probe_tick).expect("one timer fits in the test heap")
+
+    assert(!t.auto_reload, "created as a one-shot")
+
+    t.set_auto_reload(true)
+    assert(t.auto_reload, "and changed into a repeating one")
+
+    t.set_id(marker_ptr())
+    assert(t.id == marker_ptr(), "the id read back is the one written")
+
+    t.delete(0)
+
+@test
+a_command_is_queued_for_the_daemon_rather_than_acted_on() =
+    // **A command is a message, and this is the test that says so.** Every one of these is accepted --
+    // they differ only in the discriminator a macro was hiding, which is what is being checked -- and
+    // not one of them has done anything, because the daemon that acts on them has never run.
+    //
+    // That is the single most surprising thing about FreeRTOS timers and the reason `start` is
+    // documented as *queued* rather than *started*. A program that starts a timer and immediately
+    // tests `is_active` gets `false` on a real board too, if the daemon has not been scheduled yet.
+    val t = timer("probe", 100, true, null, &probe_tick).expect("one timer fits in the test heap")
+
+    assert(t.start(0), "a start is accepted")
+    assert(t.stop(0), "so is a stop")
+    assert(t.reset(0), "and a reset")
+    assert(t.set_period(200, 0), "and a change of period, which carries a value as well as a command")
+
+    assert(!t.is_active, "and nothing has happened: four commands are queued and the daemon has not run")
+    assert(t.period == 100, "not even the period, which is still the one it was created with")
+
+    t.delete(0)
+
+@test
+the_daemon_is_a_task_like_any_other_once_it_exists() =
+    // `vTaskStartScheduler` is what creates the daemon in a real program. Creating it directly is what
+    // lets this be checked without a scheduler, and is why the package keeps that name private.
+    //
+    // **This does not check that `timer_daemon` answers `None` beforehand, deliberately**, even though
+    // the handle is genuinely NULL until now: `xTimerGetTimerDaemonTaskHandle` puts a `configASSERT`
+    // on it, so on this config -- where `configASSERT` is libc's `assert` -- asking early aborts the
+    // process rather than returning. The `Option` is for a build with asserts compiled out, which is
+    // most release builds, and `timer_daemon`'s documentation says so.
+    assert(c_timer_create_daemon() == pass, "the daemon task is created")
+
+    val d = timer_daemon().expect("and now there is one")
+
+    assert(d.priority == timer_task_priority, "at configTIMER_TASK_PRIORITY, which is the knob to turn")
+
+@test
+a_timer_can_be_made_from_storage_the_caller_owns() =
+    val made = timer_static("static", 100, false, null, &probe_tick,
+                            static_timer_control[0..<timer_words])
+    val t = made.expect("storage of exactly timer_words words is what the kernel asked for")
+
+    assert(t.period == 100, "a statically created timer is a timer like any other")
+    assert(!t.auto_reload, "one-shot, as asked")
+
+    t.delete(0)
+
+@test
+static_timer_storage_too_small_for_a_control_block_is_refused() =
+    // Refused here rather than passed on, for the reason every `_static` in this package refuses:
+    // the kernel would take the pointer and write a whole control block through it.
+    assert(timer_static("small", 100, false, null, &probe_tick,
+                        static_timer_control[0..<1]).is_none(),
+           "one word is not a control block")
+
+
+// A statically created timer's control block, module storage for the reason a task's stack is.
+private var static_timer_control: [timer_words]usize = [0; timer_words]

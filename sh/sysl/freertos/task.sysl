@@ -115,6 +115,40 @@ struct Task
      */
     notify_set_bits(self, bits: u32) -> bool =
         c_notify(self.handle, 0, bits, action_set_bits, null) == pass
+
+    /** Notify this task from an interrupt handler.
+     *
+     * **The cheapest signal a handler can send**, and the reason to reach for a notification rather
+     * than a semaphore where exactly one task is waiting: there is no object, so there is nothing to
+     * create, nothing to free and no queue to be full. `notify_give_from_isr` always succeeds and
+     * answers nothing, which is why it returns no status.
+     *
+     * `woken` is the flag the handler hands to `yield_from_isr` on the way out; see `isr.sysl`.
+     */
+    notify_give_from_isr(self, woken: *bool)
+        var raw = flag_in(woken)
+
+        c_notify_give_from_isr(self.handle, 0, &raw)
+        flag_out(woken, raw)
+    end notify_give_from_isr
+
+    notify_set_bits_from_isr(self, bits: u32, woken: *bool) -> bool
+        var raw = flag_in(woken)
+        val ok = c_notify_from_isr(self.handle, 0, bits, action_set_bits, null, &raw) == pass
+
+        flag_out(woken, raw)
+        ok
+    end notify_set_bits_from_isr
+
+    /** Resume this task from an interrupt handler, answering whether a yield is now due.
+     *
+     * **The one call here that returns the flag instead of writing it**, which is the kernel's own
+     * shape and not a slip: `xTaskResumeFromISR` has nothing else to report, so the return value is
+     * the flag. A handler doing more than this still has to fold it in:
+     *
+     *     if worker.resume_from_isr() then woken = true
+     */
+    resume_from_isr(self) -> bool = c_task_resume_from_isr(self.handle) == yes
 end Task
 
 // The name the kernel keeps, which it copies into the control block and truncates to
@@ -305,3 +339,12 @@ private[freertos] extern "ulTaskGenericNotifyTake" c_notify_take(index: usize, c
 private[freertos] extern "xTaskGenericNotifyWait" c_notify_wait(index: usize, on_entry: u32,
                                                                 on_exit: u32, value: *u32,
                                                                 wait: usize) -> isize
+
+private[freertos] extern "vTaskGenericNotifyGiveFromISR" c_notify_give_from_isr(
+    t: *TaskControlBlock, index: usize, woken: *isize)
+
+private[freertos] extern "xTaskGenericNotifyFromISR" c_notify_from_isr(
+    t: *TaskControlBlock, index: usize, value: u32, action: isize, previous: *u32,
+    woken: *isize) -> isize
+
+private[freertos] extern "xTaskResumeFromISR" c_task_resume_from_isr(t: *TaskControlBlock) -> isize

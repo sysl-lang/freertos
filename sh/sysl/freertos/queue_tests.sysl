@@ -1,0 +1,205 @@
+module sh.sysl.freertos
+
+@tests
+@include("FreeRTOS.h")
+@include("task.h")
+
+// Queues. Everything here runs with no scheduler, because a send with room and a receive with
+// something waiting both complete without blocking -- only the *waiting* needs a context switch.
+
+@test
+a_queue_reports_what_it_was_created_with() =
+    val q = queue(4, sizeof(u32)).expect("a four-slot queue of u32 fits in the test heap")
+
+    assert(q.capacity == 4, "four slots")
+    assert(q.item_size == sizeof(u32), "each holding a u32")
+    assert(q.waiting == 0, "and nothing in it yet")
+    assert(q.spaces == 4, "so all four are free")
+
+    q.delete()
+
+@test
+an_item_sent_comes_back_out() =
+    val q = queue(4, sizeof(u32)).expect("a four-slot queue of u32 fits in the test heap")
+
+    assert(q.send(7u32, 0), "sending into an empty queue does not wait")
+    assert(q.waiting == 1, "and there is one in it")
+
+    var got: u32 = 0
+
+    assert(q.receive(&got, 0), "receiving from a queue holding one does not wait")
+    assert(got == 7, "and it is the value that went in")
+    assert(q.waiting == 0, "which is no longer in the queue")
+
+    q.delete()
+
+@test
+a_queue_is_first_in_first_out_and_the_front_jumps_it() =
+    // The two send positions are `queueSEND_TO_BACK` and `queueSEND_TO_FRONT`, which are macros rather
+    // than symbols -- so this is the test that the `c const` read the right one of the pair. Reversed,
+    // both sends would still succeed and the order would be wrong.
+    val q = queue(4, sizeof(u32)).expect("a four-slot queue of u32 fits in the test heap")
+
+    q.send(1u32, 0)
+    q.send(2u32, 0)
+    q.send_front(99u32, 0)
+
+    var got: u32 = 0
+
+    q.receive(&got, 0)
+    assert(got == 99, "the one sent to the front is first")
+    q.receive(&got, 0)
+    assert(got == 1, "then the rest in the order they were sent")
+    q.receive(&got, 0)
+    assert(got == 2, "all of it")
+
+    q.delete()
+
+@test
+peeking_leaves_the_item_where_it_was() =
+    val q = queue(2, sizeof(u32)).expect("a two-slot queue of u32 fits in the test heap")
+
+    q.send(5u32, 0)
+
+    var got: u32 = 0
+
+    assert(q.peek(&got, 0), "peeking at a queue holding one succeeds")
+    assert(got == 5, "and reads the item")
+    assert(q.waiting == 1, "which is still in the queue")
+
+    q.delete()
+
+@test
+a_full_queue_refuses_rather_than_waiting() =
+    val q = queue(1, sizeof(u32)).expect("a one-slot queue of u32 fits in the test heap")
+
+    assert(q.send(1u32, 0), "the first send fits")
+    assert(!q.send(2u32, 0), "the second has nowhere to go and was told not to wait")
+    assert(q.waiting == 1, "and did not overwrite what was there")
+
+    q.delete()
+
+@test
+an_empty_queue_answers_nothing_rather_than_waiting() =
+    val q = queue(1, sizeof(u32)).expect("a one-slot queue of u32 fits in the test heap")
+
+    var got: u32 = 1
+
+    assert(!q.receive(&got, 0), "there is nothing to receive")
+    assert(got == 1, "and the destination was left alone")
+
+    q.delete()
+
+@test
+overwrite_replaces_the_item_in_a_one_slot_queue() =
+    val q = queue(1, sizeof(u32)).expect("a one-slot queue of u32 fits in the test heap")
+
+    q.send(1u32, 0)
+    assert(q.overwrite(2u32), "overwriting a full one-slot queue succeeds")
+    assert(q.waiting == 1, "and there is still exactly one item")
+
+    var got: u32 = 0
+
+    q.receive(&got, 0)
+    assert(got == 2, "which is the one that overwrote")
+
+    q.delete()
+
+@test
+overwrite_is_refused_on_a_queue_with_more_than_one_slot() =
+    // `queueOVERWRITE` is only defined for a one-slot queue -- the kernel's own `configASSERT` says so
+    // -- so this is refused here rather than passed on to an assertion that may be compiled out.
+    val q = queue(2, sizeof(u32)).expect("a two-slot queue of u32 fits in the test heap")
+
+    assert(!q.overwrite(1u32), "overwrite means nothing where there is more than one slot")
+
+    q.delete()
+
+@test
+an_item_of_the_wrong_size_is_refused_rather_than_copied() =
+    // The check that makes an untyped queue safe to use through generic sends. Without it a `u64` into
+    // a queue of `u32` would have the kernel copy four bytes of an eight-byte value, and a `u16` into
+    // one of `u32` would have it read two bytes past the caller's variable.
+    val q = queue(2, sizeof(u32)).expect("a two-slot queue of u32 fits in the test heap")
+
+    assert(!q.send(7u64, 0), "a u64 is not the size of this queue's slot")
+    assert(!q.send(7u16, 0), "nor is a u16")
+    assert(q.waiting == 0, "and neither of them went in")
+
+    var wide: u64 = 0
+
+    assert(!q.receive(&wide, 0), "and nothing comes out into the wrong width either")
+
+    q.delete()
+
+@test
+a_queue_of_a_struct_copies_the_whole_thing() =
+    // A queue copies, which is what makes it the safe way to move a *value* between tasks. A struct is
+    // the case that says the copy is the struct rather than a pointer to it.
+    val q = queue(2, sizeof(Reading)).expect("a two-slot queue of Reading fits in the test heap")
+
+    assert(q.send(Reading(3, 4000000000u32), 0), "a struct the size of a slot goes in")
+
+    var got = Reading(0, 0)
+
+    assert(q.receive(&got, 0), "and comes back")
+    assert(got.channel == 3, "with its first field")
+    assert(got.value == 4000000000u32, "and its second, which does not fit in an i32")
+
+    q.delete()
+
+@test
+resetting_a_queue_throws_away_what_was_in_it() =
+    val q = queue(4, sizeof(u32)).expect("a four-slot queue of u32 fits in the test heap")
+
+    q.send(1u32, 0)
+    q.send(2u32, 0)
+    q.reset()
+
+    assert(q.waiting == 0, "nothing is left")
+    assert(q.spaces == 4, "and every slot is free again")
+
+    q.delete()
+
+@test
+a_queue_can_be_made_from_storage_the_caller_owns() =
+    // The no-allocator path. `queue_words` is the number this cannot be written without, which is why
+    // it is a `c const` and not a constant somebody transcribed.
+    var slots: [16]u8 = [0; 16]
+    var control: [queue_words]usize = [0; queue_words]
+
+    val q = queue_static(slots[0..<16], control[0..<queue_words], sizeof(u32)).expect("sixteen bytes is four u32 slots")
+
+    assert(q.capacity == 4, "the capacity comes from the storage and the item size")
+    assert(q.send(9u32, 0), "and it works exactly as a heap-allocated one does")
+
+    var got: u32 = 0
+
+    q.receive(&got, 0)
+    assert(got == 9, "including what comes back out")
+
+    q.delete()
+
+@test
+static_storage_too_small_for_a_control_block_is_refused() =
+    var slots: [16]u8 = [0; 16]
+    var control: [1]usize = [0; 1]
+
+    // One word is not a control block on any port -- `queue_words` is 21 on the POSIX port and 20 on a
+    // Cortex-M -- and handing it over would have the kernel write over whatever is next to it.
+    assert(queue_static(slots[0..<16], control[0..<1], sizeof(u32)).is_none(),
+           "a control block that could not fit is refused rather than written into")
+
+@test
+a_zero_item_size_is_refused_rather_than_dividing_by_it() =
+    var slots: [16]u8 = [0; 16]
+    var control: [queue_words]usize = [0; queue_words]
+
+    assert(queue_static(slots[0..<16], control[0..<queue_words], 0).is_none(),
+           "a slot of no bytes has no capacity to compute")
+
+// A struct the size of a queue slot, for the copying test above. Two fields rather than one so that a
+// binding that copied only the first would be caught.
+private struct Reading
+    channel: u32
+    value: u32

@@ -19,9 +19,12 @@ package {
   version = "0.1.0"
 }
 
-// **This package declares and does not implement.** There is no kernel source here, no port, no
-// `FreeRTOSConfig.h`, and no `.c` file of any kind: every name below is a symbol the kernel you
-// built already has.
+// **This package declares and very nearly does not implement.** There is no kernel source here, no
+// port and no `FreeRTOSConfig.h`: every name below is a symbol the kernel *you* built already has --
+// with one exception, `sh/sysl/freertos/yield.c`, which is four lines. It is there because
+// `portYIELD_FROM_ISR` is a **macro** on every port, expanding to something different on each, so
+// there is no symbol to declare and no portable body to write in sysl. It compiles against your
+// headers like everything else; its own comment says the rest.
 //
 // That is not a shortcut, it is the only shape that works. `FreeRTOSConfig.h` is ABI --
 // `configUSE_16_BIT_TICKS` moves `TickType_t` between 16 and 32 bits, and

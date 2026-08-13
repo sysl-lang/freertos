@@ -1,0 +1,185 @@
+module sh.sysl.freertos
+
+@tests
+@include("FreeRTOS.h")
+@include("task.h")
+
+// The interrupt half.
+//
+// **These call the `_from_isr` functions from a task, which on a real board would be wrong.** They are
+// testing the *binding* rather than the usage: that the symbol resolves, that the `woken` flag is in
+// the right argument position and is written through, and that a discriminator hidden in a macro was
+// the right one. The POSIX port permits the call -- it has no interrupt priorities to check against --
+// and the kernel's own `configASSERT` is what would refuse it on a Cortex-M.
+//
+// What cannot be tested here is a task actually being woken, since nothing can be blocked with no
+// scheduler. So `woken` comes back `false` everywhere below, and the tests say so deliberately rather
+// than by accident: a binding that never wrote the flag at all would pass these, which is why
+// `the_woken_flag_travels_by_reference` exists.
+
+@test
+an_item_sent_from_an_interrupt_comes_back_out() =
+    val q = queue(4, sizeof(u32)).expect("a four-slot queue fits in the test heap")
+
+    var woken = false
+
+    assert(q.send_from_isr(9u32, &woken), "a send from a handler does not wait and does not fail here")
+    assert(!woken, "and woke nobody, because nothing can be blocked with no scheduler")
+    assert(q.waiting_from_isr == 1, "the count read the handler's way agrees with the ordinary one")
+    assert(q.waiting == 1, "which is the same queue either way")
+
+    var got: u32 = 0
+
+    assert(q.peek_from_isr(&got), "peeking from a handler reads it")
+    assert(got == 9, "and it is the value that went in")
+    assert(q.waiting == 1, "and leaves it where it was")
+
+    got = 0
+    assert(q.receive_from_isr(&got, &woken), "receiving from a handler takes it")
+    assert(got == 9, "and it is still the value that went in")
+    assert(q.is_empty_from_isr, "leaving the queue empty")
+
+    q.delete()
+
+@test
+the_woken_flag_travels_by_reference_and_is_never_lowered() =
+    // Two claims, and the second is the one that would break a real handler. The flag accumulates
+    // across every call in the handler and is acted on once at the end, so a call that woke nobody
+    // must leave a flag that an earlier call raised **alone**. A binding that wrote the kernel's
+    // answer straight into the caller's `bool` would clear it, and the woken task would then wait a
+    // whole tick -- silently, and only under the interleaving where two calls are made.
+    val q = queue(1, sizeof(u32)).expect("a one-slot queue fits in the test heap")
+
+    var woken = true
+
+    assert(q.send_from_isr(1u32, &woken), "a send from a handler")
+    assert(woken, "leaves a flag raised by an earlier call raised")
+
+    woken = false
+    assert(!q.send_from_isr(2u32, &woken), "a send to a full queue fails")
+    assert(!woken, "and raises nothing")
+
+    q.delete()
+
+@test
+a_semaphore_given_from_an_interrupt_is_there_to_be_taken() =
+    // The commonest thing a handler does, and the reason `give_from_isr` is a different function from
+    // `give`: the ordinary one may block on the kernel's lock.
+    val s = binary_semaphore().expect("a binary semaphore fits in the test heap")
+
+    var woken = false
+
+    assert(s.give_from_isr(&woken), "the handler gives")
+    assert(s.count == 1, "and the semaphore is available")
+    assert(!s.give_from_isr(&woken), "a binary semaphore takes only one, from a handler as from a task")
+
+    assert(s.take_from_isr(&woken), "and it can be taken from a handler too")
+    assert(s.count == 0, "which empties it")
+    assert(!s.take_from_isr(&woken), "so there is nothing left to take, and no waiting to do")
+
+    s.delete()
+
+@test
+a_notification_from_an_interrupt_raises_the_target_s_value() =
+    // The cheapest signal there is: no object, so nothing to create and nothing to be full.
+    val t = task("probe", min_stack, 1, &idle_body, null).expect("one minimal task fits in the test heap")
+
+    var woken = false
+
+    t.notify_give_from_isr(&woken)
+    assert(!woken, "notifying a task that is not waiting wakes nobody")
+
+    assert(t.notify_set_bits_from_isr(0x0F, &woken), "and the bit-field form answers a status")
+    assert(!t.resume_from_isr(), "resuming a task that was never suspended needs no yield")
+
+    t.delete()
+
+@test
+bytes_sent_from_an_interrupt_come_back_out() =
+    val s = stream(16, 1).expect("a sixteen-byte stream fits in the test heap")
+
+    var woken = false
+
+    assert(s.send_from_isr("hi".bytes, &woken) == 2, "two bytes go in from the handler")
+    assert(s.available == 2, "and are waiting")
+
+    var got: [4]u8 = [0; 4]
+
+    assert(s.receive_from_isr(got[0..<4], &woken) == 2, "and come back out the same way")
+    assert(got[0] == u8('h') && got[1] == u8('i'), "unchanged")
+
+    s.delete()
+
+@test
+the_yield_is_a_real_symbol_and_does_nothing_when_nothing_was_woken() =
+    // **The one thing in this package with C behind it**, so this is the test that the translation
+    // unit is compiled, linked and reachable -- not that it switches context, which needs a scheduler
+    // and would take the runner with it.
+    //
+    // `false` is `portEND_SWITCHING_ISR(pdFALSE)`, whose whole body is the else branch, so it is safe
+    // to call here and is exactly the case a handler that woke nobody takes.
+    yield_from_isr(false)
+
+    assert(tick_count_from_isr() == tick_count(),
+           "and the handler's way of reading the tick agrees with the task's, no scheduler having run")
+
+@test
+an_event_group_set_from_an_interrupt_is_queued_for_the_daemon() =
+    // Unlike everything else here, this one does **not** do the work: setting a bit unblocks waiters,
+    // which is unbounded, so the kernel defers it to the timer daemon. What comes back is whether the
+    // request was queued, and the bits are still unset when it returns -- which is the trap the
+    // method's documentation is about, pinned here so it cannot quietly change.
+    //
+    // **The daemon has to exist first**, and finding that out is what this test is worth beyond the
+    // binding: without the timer service there is no queue to defer to, and the kernel's own
+    // `configASSERT` fires inside `xQueueGenericSendFromISR` naming a null queue, which says nothing
+    // about event groups. In a real program `start` has created it; here it is created directly.
+    assert(c_timer_create_daemon() == pass, "there is a timer service to defer the work to")
+
+    val e = events().expect("an event group fits in the test heap")
+
+    var woken = false
+
+    assert(e.set_from_isr(0x01, &woken), "the request goes on the daemon's queue")
+    assert(e.bits_from_isr == 0, "and the bit is not set, because the daemon has not run")
+    assert(e.bits == 0, "which the ordinary reader agrees about")
+
+    e.delete()
+
+@test
+a_timer_command_from_an_interrupt_carries_its_own_command_number() =
+    // The FROM_ISR command numbers are different values, not the same ones by another route, because
+    // the daemon reads them to know which clock the command's *now* came from. Swapping the two sets
+    // would compile, link, and drift a timer by whatever the two disagreed on -- so this checks the
+    // discriminators reach the kernel and are accepted.
+    val t = timer("probe", 100, true, null, &probe_tick).expect("one timer fits in the test heap")
+
+    var woken = false
+
+    assert(t.start_from_isr(&woken), "a start from a handler is accepted")
+    assert(t.stop_from_isr(&woken), "and a stop")
+    assert(t.reset_from_isr(&woken), "and a reset")
+    assert(t.set_period_from_isr(200, &woken), "and a change of period")
+
+    assert(!t.is_active, "and none of them has happened, for the same reason as from a task")
+
+    t.delete(0)
+
+@test
+the_command_queue_is_finite_and_says_so_when_it_is_full() =
+    // The other half of *a command is a message*: the daemon's queue is `configTIMER_QUEUE_LENGTH`
+    // entries and a command that will not fit is refused. This is what a `false` from `start` means
+    // when the arguments were good, and without a name for the length it is unattributable.
+    //
+    // **This test deliberately leaves the queue full**, because nothing drains it without a running
+    // daemon -- and that costs the tests after it nothing, since each gets a kernel of its own.
+    val t = timer("probe", 100, true, null, &probe_tick).expect("one timer fits in the test heap")
+
+    var accepted: usize = 0
+
+    for i in 0..<(timer_queue_length + 8)
+        if t.start(0) then accepted += 1
+
+    assert(accepted <= timer_queue_length, "the queue never took more than it has room for")
+    assert(accepted > 0, "and it did take some, so this measured a full queue rather than a broken one")
+

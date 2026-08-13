@@ -116,6 +116,35 @@ struct Timer
      */
     delete(self, wait: usize) -> bool =
         c_timer_command(self.handle, cmd_delete, 0, null, wait) == pass
+
+    /** The same four commands, issued from an interrupt handler.
+     *
+     * **The command numbers are different ones**, not the same numbers sent by a different route: the
+     * daemon has to know which side a command came from, because a start from a handler takes its
+     * *now* from `xTaskGetTickCountFromISR` rather than `xTaskGetTickCount`. That is the discriminator
+     * `c const` reads, and getting it wrong would compile and link and drift the timer by whatever the
+     * two clocks disagreed on.
+     *
+     * There is no `wait`: a handler may not block, so a full queue is an immediate `false`.
+     */
+    start_from_isr(self, woken: *bool) -> bool =
+        self.command_from_isr(cmd_start_from_isr, c_tick_count_from_isr(), woken)
+
+    stop_from_isr(self, woken: *bool) -> bool = self.command_from_isr(cmd_stop_from_isr, 0, woken)
+
+    reset_from_isr(self, woken: *bool) -> bool =
+        self.command_from_isr(cmd_reset_from_isr, c_tick_count_from_isr(), woken)
+
+    set_period_from_isr(self, period: usize, woken: *bool) -> bool =
+        self.command_from_isr(cmd_change_period_from_isr, period, woken)
+
+    private[freertos] command_from_isr(self, command: isize, value: usize, woken: *bool) -> bool
+        var raw = flag_in(woken)
+        val ok = c_timer_command_from_isr(self.handle, command, value, &raw, 0) == pass
+
+        flag_out(woken, raw)
+        ok
+    end command_from_isr
 end Timer
 
 /** The `Timer` for a handle, which is what a callback does with the one it is given.
@@ -161,6 +190,13 @@ private[freertos] c const
     cmd_reset: isize         = "tmrCOMMAND_RESET"
     cmd_change_period: isize = "tmrCOMMAND_CHANGE_PERIOD"
     cmd_delete: isize        = "tmrCOMMAND_DELETE"
+
+    // Distinct numbers rather than the same ones, because the daemon reads them to know which clock
+    // the command's *now* was taken from. There is no delete-from-ISR: freeing is unbounded work.
+    cmd_start_from_isr: isize         = "tmrCOMMAND_START_FROM_ISR"
+    cmd_stop_from_isr: isize          = "tmrCOMMAND_STOP_FROM_ISR"
+    cmd_reset_from_isr: isize         = "tmrCOMMAND_RESET_FROM_ISR"
+    cmd_change_period_from_isr: isize = "tmrCOMMAND_CHANGE_PERIOD_FROM_ISR"
 
 /** Create a timer from the kernel's heap, `None` if there is not enough of it.
  *
@@ -255,6 +291,9 @@ private[freertos] extern "xTimerGenericCommandFromTask" c_timer_command(t: *Time
                                                                         value: usize,
                                                                         woken: *isize,
                                                                         wait: usize) -> isize
+
+private[freertos] extern "xTimerGenericCommandFromISR" c_timer_command_from_isr(
+    t: *TimerControl, command: isize, value: usize, woken: *isize, wait: usize) -> isize
 
 private[freertos] extern "xTimerIsTimerActive" c_timer_is_active(t: *TimerControl) -> isize
 private[freertos] extern "xTimerGetPeriod" c_timer_period(t: *TimerControl) -> usize

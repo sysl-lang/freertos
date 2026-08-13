@@ -93,6 +93,41 @@ struct Events
     sync(self, set: usize, wait_for: usize, wait: usize) -> usize =
         c_event_sync(self.handle, set, wait_for, wait)
 
+    /** Set bits from an interrupt handler, `false` if the daemon's queue was full.
+     *
+     * **This one does not do the work itself, and the difference matters.** Setting a bit unblocks
+     * every waiter it satisfies, which is unbounded work and so is not something a handler may do --
+     * so the kernel defers it to the timer daemon and this answers whether the *request* was queued.
+     * The bits are not set when it returns, and a handler that read them back would see the old value.
+     *
+     * Three consequences a program has to live with:
+     *
+     *   - it needs `configUSE_TIMERS 1` and `INCLUDE_xTimerPendFunctionCall 1`, and does not link
+     *     without them -- **and it needs the timer service to have been created**, which `start`
+     *     does, so this cannot be used before the scheduler is running. The kernel's answer to that
+     *     mistake is a `configASSERT` inside `xQueueGenericSendFromISR` naming a null queue, which
+     *     says nothing about event groups;
+     *   - the latency is the daemon's, so `configTIMER_TASK_PRIORITY` decides how soon the waiters
+     *     actually wake;
+     *   - `false` means `configTIMER_QUEUE_LENGTH` was full, which under a burst of interrupts is a
+     *     real possibility rather than a theoretical one.
+     *
+     * A handler that needs to signal one task with none of this should use a task notification.
+     */
+    set_from_isr(self, bits: usize, woken: *bool) -> bool
+        var raw = flag_in(woken)
+        val ok = c_event_set_from_isr(self.handle, bits, &raw) == pass
+
+        flag_out(woken, raw)
+        ok
+    end set_from_isr
+
+    /** The bits as they stand, read from an interrupt handler.
+     *
+     * Unlike `set_from_isr` this is immediate: reading takes no lock and wakes nobody.
+     */
+    bits_from_isr -> usize = c_event_bits_from_isr(self.handle)
+
     /** Free the group, and whatever the kernel allocated with it.
      *
      * Tasks blocked on it are unblocked with the bits they were waiting for *not* set, so a waiter
@@ -152,3 +187,10 @@ private[freertos] extern "xEventGroupSync" c_event_sync(g: *EventGroupControl, s
                                                         wait_for: usize, wait: usize) -> usize
 
 private[freertos] extern "vEventGroupDelete" c_event_delete(g: *EventGroupControl)
+
+private[freertos] extern "xEventGroupSetBitsFromISR" c_event_set_from_isr(g: *EventGroupControl,
+                                                                          bits: usize,
+                                                                          woken: *isize) -> isize
+
+private[freertos] extern "xEventGroupGetBitsFromISR" c_event_bits_from_isr(
+    g: *EventGroupControl) -> usize

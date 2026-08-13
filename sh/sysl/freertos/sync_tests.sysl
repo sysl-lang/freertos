@@ -1,0 +1,122 @@
+module sh.sysl.freertos
+
+@tests
+@include("FreeRTOS.h")
+@include("task.h")
+
+// Semaphores and mutexes. A give and a take that do not have to wait are ordinary writes to the
+// kernel's own structures, so the whole surface is reachable with no scheduler.
+
+@test
+a_binary_semaphore_starts_empty() =
+    // The kernel's own convention and the one people get wrong: `xSemaphoreCreateBinary` does *not*
+    // hand back something already available, so a task that takes before anybody gives will wait.
+    val s = binary_semaphore().expect("a binary semaphore fits in the test heap")
+
+    assert(s.count == 0, "nothing has been given")
+    assert(!s.take(0), "so taking one finds nothing")
+
+    s.delete()
+
+@test
+a_binary_semaphore_holds_one_and_only_one() =
+    val s = binary_semaphore().expect("a binary semaphore fits in the test heap")
+
+    assert(s.give(), "the first give succeeds")
+    assert(s.count == 1, "and it is available")
+    assert(!s.give(), "the second has nowhere to go — this is what makes it binary")
+    assert(s.count == 1, "and did not raise the count")
+
+    assert(s.take(0), "taking finds the one")
+    assert(!s.take(0), "and there is not a second")
+
+    s.delete()
+
+@test
+a_counting_semaphore_counts() =
+    val s = counting_semaphore(3, 0).expect("a counting semaphore fits in the test heap")
+
+    assert(s.count == 0, "it started at zero, as asked")
+
+    s.give()
+    s.give()
+    assert(s.count == 2, "two gives is two")
+    assert(s.give(), "and the third fits")
+    assert(!s.give(), "but the fourth is past the maximum")
+    assert(s.count == 3, "which is where it stops")
+
+    assert(s.take(0), "and they come back out")
+    assert(s.count == 2, "one at a time")
+
+    s.delete()
+
+@test
+a_counting_semaphore_can_start_full() =
+    // The pool-of-n shape, as against the count-of-events shape above. Both are the same object and the
+    // difference is the initial count, which is the argument this checks reached the right parameter.
+    val s = counting_semaphore(3, 3).expect("a counting semaphore fits in the test heap")
+
+    assert(s.count == 3, "all three are there to be taken")
+    assert(s.take(0) && s.take(0) && s.take(0), "and all three can be")
+    assert(!s.take(0), "and then there are none")
+
+    s.delete()
+
+@test
+a_counting_semaphore_will_not_start_above_its_maximum() =
+    assert(counting_semaphore(2, 3).is_none(), "three of a maximum of two is not a state to start in")
+    assert(counting_semaphore(0, 0).is_none(), "a semaphore of maximum zero has nothing to hold")
+
+@test
+a_mutex_starts_unlocked_and_locks_once() =
+    val m = mutex().expect("a mutex fits in the test heap")
+
+    assert(m.lock(0), "an unlocked mutex is there to be taken")
+    assert(m.unlock(), "and given back")
+
+    m.delete()
+
+@test
+a_recursive_mutex_can_be_locked_twice_by_its_holder() =
+    // The reason `RecursiveMutex` is a separate type. The recursion count lives inside
+    // `xQueueTakeMutexRecursive`, so a plain take of the same mutex would find it unavailable and wait
+    // — against the task that already holds it, which is a deadlock the types here make unwriteable.
+    val m = recursive_mutex().expect("a recursive mutex fits in the test heap")
+
+    assert(m.lock(0), "taken once")
+    assert(m.lock(0), "and again by the same holder")
+    assert(m.unlock(), "given back once")
+    assert(m.unlock(), "and again, which is when it is actually free")
+
+    m.delete()
+
+@test
+a_semaphore_can_be_made_from_storage_the_caller_owns() =
+    var control: [semaphore_words]usize = [0; semaphore_words]
+
+    val s = binary_semaphore_static(control[0..<semaphore_words]).expect("semaphore_words words is a semaphore's control block")
+
+    assert(s.count == 0, "which starts empty exactly as the heap-allocated one does")
+    assert(s.give() && s.take(0), "and works")
+
+    s.delete()
+
+@test
+a_mutex_can_be_made_from_storage_the_caller_owns() =
+    var control: [semaphore_words]usize = [0; semaphore_words]
+
+    val m = mutex_static(control[0..<semaphore_words]).expect("semaphore_words words is a mutex's control block")
+
+    assert(m.lock(0) && m.unlock(), "and it locks")
+
+    m.delete()
+
+@test
+storage_too_small_for_a_semaphore_is_refused() =
+    var control: [1]usize = [0; 1]
+
+    assert(binary_semaphore_static(control[0..<1]).is_none(), "one word is not a control block")
+    assert(mutex_static(control[0..<1]).is_none(), "nor is it a mutex's")
+    assert(counting_semaphore_static(2, 0, control[0..<1]).is_none(), "nor a counting semaphore's")
+    assert(recursive_mutex_static(control[0..<1]).is_none(), "nor a recursive mutex's")
+

@@ -51,6 +51,39 @@ struct Semaphore
      */
     count -> usize = c_sem_count(self.handle)
 
+    /** Give the semaphore from an interrupt handler, which is what a semaphore is mostly for.
+     *
+     * The classic shape: hardware signals, the handler gives, a task blocked in `take(forever)` wakes
+     * and does the work. `false` means a binary semaphore was already given or a counting one is at
+     * its maximum -- events arriving faster than the task takes them, which is worth counting rather
+     * than ignoring.
+     *
+     * `woken` is the flag the handler hands to `yield_from_isr` on the way out; see `isr.sysl`. **On
+     * this one it is the difference between a response time of microseconds and one of a whole tick**,
+     * because the task this wakes is usually the reason the interrupt exists.
+     */
+    give_from_isr(self, woken: *bool) -> bool
+        var raw = flag_in(woken)
+        val ok = c_sem_give_from_isr(self.handle, &raw) == pass
+
+        flag_out(woken, raw)
+        ok
+    end give_from_isr
+
+    /** Take the semaphore from an interrupt handler, never waiting.
+     *
+     * Rarely what you want -- a handler taking a semaphore usually means the work belongs in a task --
+     * but it is the kernel's operation and it is here. `false` means the count was zero, which for a
+     * handler is the end of it, since there is nothing to wait on.
+     */
+    take_from_isr(self, woken: *bool) -> bool
+        var raw = flag_in(woken)
+        val ok = c_sem_take_from_isr(self.handle, &raw) == pass
+
+        flag_out(woken, raw)
+        ok
+    end take_from_isr
+
     /** Free it. Nothing may be blocked on it, and static storage is not touched. */
     delete(self) = c_sem_delete(self.handle)
 end Semaphore
@@ -221,6 +254,24 @@ private[freertos] extern "xQueueGenericSend" c_sem_give(s: *SemaphoreControl, it
 
 private[freertos] extern "uxQueueMessagesWaiting" c_sem_count(s: *SemaphoreControl) -> usize
 private[freertos] extern "vQueueDelete" c_sem_delete(s: *SemaphoreControl)
+
+// `xSemaphoreTakeFromISR` is `xQueueReceiveFromISR` with a null destination -- a semaphore's items are
+// zero bytes, so there is nothing to copy out and only the count moves. Another macro over a real
+// function, and the same shape as everything else `c const` and these declarations undo.
+//
+// **There is deliberately no `_from_isr` on a `Mutex` or a `RecursiveMutex`, and that is not an
+// omission.** A mutex has an owner and does priority inheritance on it, and an interrupt handler is
+// not a task, so there is nobody for the kernel to inherit to or to check the unlock against.
+// FreeRTOS refuses it outright; a handler that needs to signal a task wants a binary semaphore.
+private[freertos] extern "xQueueGiveFromISR" c_sem_give_from_isr(s: *SemaphoreControl,
+                                                                 woken: *isize) -> isize
+
+private[freertos] extern "xQueueReceiveFromISR" c_sem_take_from_isr_raw(s: *SemaphoreControl,
+                                                                        into: *u8,
+                                                                        woken: *isize) -> isize
+
+private[freertos] c_sem_take_from_isr(s: *SemaphoreControl, woken: *isize) -> isize =
+    c_sem_take_from_isr_raw(s, null, woken)
 
 private[freertos] extern "xQueueTakeMutexRecursive" c_mutex_take_recursive(m: *SemaphoreControl,
                                                                           wait: usize) -> isize

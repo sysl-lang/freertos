@@ -127,6 +127,79 @@ struct Queue
      */
     reset(self) = c_queue_reset(self.handle)
 
+    /** Copy an item onto the back of the queue from an interrupt handler, never waiting.
+     *
+     * `false` means the queue was full, or that `T` is not the size of a slot. `woken` is the flag the
+     * handler accumulates and hands to `yield_from_isr` on the way out -- see `isr.sysl` for the shape
+     * of a handler and for why leaving the yield out is a latency bug rather than a wrong answer.
+     *
+     * There is no `wait`, because a handler may not block. That is the whole difference from `send`.
+     */
+    send_from_isr[T](self, item: T, woken: *bool) -> bool
+        if sizeof(T) != self.item_size then return false
+
+        var raw = flag_in(woken)
+        val ok = c_queue_send_from_isr(self.handle, ptr_cast(&item), &raw, send_to_back) == pass
+
+        flag_out(woken, raw)
+        ok
+    end send_from_isr
+
+    send_front_from_isr[T](self, item: T, woken: *bool) -> bool
+        if sizeof(T) != self.item_size then return false
+
+        var raw = flag_in(woken)
+        val ok = c_queue_send_from_isr(self.handle, ptr_cast(&item), &raw, send_to_front) == pass
+
+        flag_out(woken, raw)
+        ok
+    end send_front_from_isr
+
+    overwrite_from_isr[T](self, item: T, woken: *bool) -> bool
+        if sizeof(T) != self.item_size || self.capacity != 1 then return false
+
+        var raw = flag_in(woken)
+        val ok = c_queue_send_from_isr(self.handle, ptr_cast(&item), &raw, overwrite_slot) == pass
+
+        flag_out(woken, raw)
+        ok
+    end overwrite_from_isr
+
+    /** Take the front item off the queue from an interrupt handler, never waiting.
+     *
+     * `false` means the queue was empty, and in that case `into` is not written.
+     */
+    receive_from_isr[T](self, into: *T, woken: *bool) -> bool
+        if sizeof(T) != self.item_size then return false
+
+        var raw = flag_in(woken)
+        val ok = c_queue_receive_from_isr(self.handle, ptr_cast(into), &raw) == pass
+
+        flag_out(woken, raw)
+        ok
+    end receive_from_isr
+
+    /** Read the front item from an interrupt handler without removing it.
+     *
+     * No `woken` flag, and that is the kernel's design rather than an omission here: a peek takes
+     * nothing, so no task waiting to send can have become ready.
+     */
+    peek_from_isr[T](self, into: *T) -> bool
+        if sizeof(T) != self.item_size then return false
+
+        c_queue_peek_from_isr(self.handle, ptr_cast(into)) == pass
+    end peek_from_isr
+
+    /** The counts and the emptiness, read from an interrupt handler.
+     *
+     * Separate functions from their ordinary twins because those may take the kernel's lock on some
+     * ports, which a handler may not wait on.
+     */
+    waiting_from_isr -> usize = c_queue_waiting_from_isr(self.handle)
+
+    is_empty_from_isr -> bool = c_queue_is_empty_from_isr(self.handle) == yes
+    is_full_from_isr -> bool = c_queue_is_full_from_isr(self.handle) == yes
+
     /** Free the queue, and whatever the kernel allocated with it.
      *
      * Nothing may be blocked on it. A statically created queue's storage is yours and is not touched;
@@ -197,6 +270,24 @@ private[freertos] extern "xQueueGenericCreateStatic" c_queue_create_static(capac
 
 private[freertos] extern "xQueueGenericSend" c_queue_send(q: *QueueControl, item: *u8, wait: usize,
                                                           position: isize) -> isize
+
+private[freertos] extern "xQueueGenericSendFromISR" c_queue_send_from_isr(
+    q: *QueueControl, item: *u8, woken: *isize, position: isize) -> isize
+
+private[freertos] extern "xQueueReceiveFromISR" c_queue_receive_from_isr(
+    q: *QueueControl, into: *u8, woken: *isize) -> isize
+
+private[freertos] extern "xQueuePeekFromISR" c_queue_peek_from_isr(q: *QueueControl,
+                                                                   into: *u8) -> isize
+
+private[freertos] extern "uxQueueMessagesWaitingFromISR" c_queue_waiting_from_isr(
+    q: *QueueControl) -> usize
+
+private[freertos] extern "xQueueIsQueueEmptyFromISR" c_queue_is_empty_from_isr(
+    q: *QueueControl) -> isize
+
+private[freertos] extern "xQueueIsQueueFullFromISR" c_queue_is_full_from_isr(
+    q: *QueueControl) -> isize
 
 private[freertos] extern "xQueueReceive" c_queue_receive(q: *QueueControl, into: *u8,
                                                          wait: usize) -> isize

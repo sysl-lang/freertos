@@ -1,0 +1,160 @@
+module sh.sysl.freertos
+
+@tests
+@include("FreeRTOS.h")
+@include("task.h")
+
+// Stream and message buffers.
+//
+// These need no scheduler for the same reason a queue does not: a send with room and a receive with
+// bytes waiting both complete without blocking, and only the *waiting* would need a context switch.
+
+@test
+a_stream_takes_bytes_and_gives_them_back_in_order() =
+    val s = stream(16, 1).expect("a sixteen-byte stream fits in the test heap")
+
+    assert(s.is_empty, "a new stream holds nothing")
+    assert(s.spaces == 16, "and all of it is free")
+
+    assert(s.send("hello".bytes, 0) == 5, "five bytes go in")
+    assert(s.available == 5, "and five are waiting")
+
+    var got: [8]u8 = [0; 8]
+
+    assert(s.receive(got[0..<8], 0) == 5, "asking for eight gets the five there are")
+    assert(got[0] == u8('h') && got[4] == u8('o'), "which are the bytes that went in, in order")
+    assert(s.is_empty, "and the stream is empty again")
+
+    s.delete()
+
+@test
+a_stream_keeps_no_boundaries_between_sends() =
+    // The property that decides between the two types. Two sends read back as one run of bytes, which
+    // is right for a UART and wrong for anything with records in it.
+    val s = stream(16, 1).expect("a sixteen-byte stream fits in the test heap")
+
+    s.send("abc".bytes, 0)
+    s.send("de".bytes, 0)
+
+    var got: [8]u8 = [0; 8]
+
+    assert(s.receive(got[0..<8], 0) == 5, "one receive gets both sends")
+    assert(got[2] == u8('c') && got[3] == u8('d'), "run together with nothing between them")
+
+    s.delete()
+
+@test
+a_full_stream_takes_what_fits_and_says_how_much() =
+    // A short count is the normal answer rather than an error, and it is the whole reason `send`
+    // answers a number. A binding returning a bool here would throw away which bytes still have to go.
+    val s = stream(4, 1).expect("a four-byte stream fits in the test heap")
+
+    assert(s.send("abcdefgh".bytes, 0) == 4, "four of the eight fit")
+    assert(s.is_full, "and now it is full")
+    assert(s.send("i".bytes, 0) == 0, "so nothing more goes in without waiting")
+
+    s.delete()
+
+@test
+sending_or_receiving_nothing_is_refused_before_it_reaches_the_kernel() =
+    // An empty slice's pointer is null, and the kernel copies with `memcpy` -- for which a null source
+    // is undefined behaviour even at a length of zero. Cheaper to answer here than to reason about.
+    val s = stream(8, 1).expect("an eight-byte stream fits in the test heap")
+
+    var none: [1]u8 = [0; 1]
+
+    assert(s.send(none[0..<0], 0) == 0, "sending no bytes writes none")
+    assert(s.receive(none[0..<0], 0) == 0, "and receiving into nowhere reads none")
+    assert(s.is_empty, "with the buffer untouched either way")
+
+    s.delete()
+
+@test
+a_message_buffer_keeps_the_boundaries_a_stream_does_not() =
+    val m = messages(64).expect("a sixty-four-byte message buffer fits in the test heap")
+
+    assert(m.send("abc".bytes, 0), "one message")
+    assert(m.send("de".bytes, 0), "and another")
+
+    var got: [8]u8 = [0; 8]
+
+    assert(m.receive(got[0..<8], 0) == 3, "the first receive gets the first message and stops")
+    assert(got[0] == u8('a') && got[2] == u8('c'), "all of it")
+    assert(m.receive(got[0..<8], 0) == 2, "and the second gets the second")
+
+    m.delete()
+
+@test
+a_message_is_all_or_nothing() =
+    // The other half of the same distinction: a `Stream` would have taken the front of this and said
+    // so, and a partial message is not a thing a reader could do anything with.
+    val m = messages(8 + message_overhead).expect("a small message buffer fits in the test heap")
+
+    assert(m.send("abcdefgh".bytes, 0), "a message that exactly fits goes")
+    assert(!m.send("x".bytes, 0), "and the next does not, because there is no room for its length too")
+    assert(m.next_length == 8, "the one that went is still whole")
+
+    m.delete()
+
+@test
+the_length_of_the_next_message_is_readable_before_it_is_taken() =
+    // The only way to tell a timeout from a message that would not fit, since `receive` answers zero
+    // for both -- which is the sharp edge `Messages.receive` documents.
+    val m = messages(64).expect("a sixty-four-byte message buffer fits in the test heap")
+
+    assert(m.next_length == 0, "nothing waiting")
+
+    m.send("abcde".bytes, 0)
+    assert(m.next_length == 5, "and now a five-byte message is")
+
+    var small: [2]u8 = [0; 2]
+
+    assert(m.receive(small[0..<2], 0) == 0, "which will not fit in two bytes, so nothing is read")
+    assert(m.next_length == 5, "and it is still there, rather than lost to a receive that failed")
+
+    m.delete()
+
+@test
+a_stream_s_trigger_level_is_bounded_by_its_capacity() =
+    val s = stream(8, 1).expect("an eight-byte stream fits in the test heap")
+
+    assert(s.set_trigger_level(4), "a level within the capacity is accepted")
+    assert(!s.set_trigger_level(9), "one above it could never be reached, so the kernel refuses it")
+
+    s.delete()
+
+@test
+a_stream_that_could_never_be_read_is_refused_at_creation() =
+    // Refused here rather than passed on, because the kernel's own answer to a trigger level above the
+    // capacity at *creation* is a `configASSERT` rather than a null.
+    assert(stream(0, 1).is_none(), "a stream of no bytes holds nothing")
+    assert(stream(8, 0).is_none(), "a trigger of none is not a level the kernel accepts")
+    assert(stream(8, 9).is_none(), "and one above the capacity could never be reached")
+    assert(messages(0).is_none(), "a message buffer of no bytes holds no message")
+
+@test
+a_stream_can_be_made_from_storage_the_caller_owns() =
+    // And the usable capacity is one byte less than the storage, which the dynamic path hides by
+    // allocating one more than asked for. Pinned here because it is the one number a caller at the
+    // boundary would otherwise get wrong.
+    val made = stream_static(static_stream_storage[0..<16], static_stream_control[0..<stream_words], 1)
+    val s = made.expect("sixteen bytes and a control block is what the kernel asked for")
+
+    assert(s.spaces == 15, "one byte of the sixteen is the kernel's, to tell full from empty")
+    assert(s.send("hello".bytes, 0) == 5, "and the rest is a stream like any other")
+
+    s.delete()
+
+@test
+static_stream_storage_too_small_is_refused() =
+    assert(stream_static(static_stream_storage[0..<1], static_stream_control[0..<stream_words], 1)
+               .is_none(),
+           "one byte is all header and no capacity")
+
+    assert(stream_static(static_stream_storage[0..<16], static_stream_control[0..<1], 1).is_none(),
+           "and one word is not a control block")
+
+
+// A statically created buffer's storage and control block, module storage as ever.
+private var static_stream_control: [stream_words]usize = [0; stream_words]
+private var static_stream_storage: [16]u8 = [0; 16]
