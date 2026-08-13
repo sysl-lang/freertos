@@ -256,6 +256,10 @@ sysl test . --link-path /tmp/lib \
   --include-path freertos-config=$C
 ```
 
+> **That needs sysl 0.0.46 or newer.** Before it, `sysl test` was the one subcommand that did not pass
+> `--include-path` on to a `c const` block's probe compile, so the headers were not found and `CPATH`
+> was the way around it. `run`, `build` and `build-lib` were always fine.
+
 ## What is bound
 
 **All of it.** Every object FreeRTOS offers, each with a `_static` twin where the kernel has one, and
