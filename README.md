@@ -190,10 +190,10 @@ sysl: allocator: pvPortMalloc / vPortFree (named by freertos)
 Two consequences worth knowing:
 
 - **`free_heap()` is a number about your whole program**, not just about the kernel's objects, which is
-  what makes it useful for sizing `configTOTAL_HEAP_SIZE`. That holds when you reach this package by a
-  `dependencies` coordinate. **It does not hold under `--lib`**, where sysl 0.0.46 does not read the
-  declared allocator and your program's own allocations come from libc instead — two heaps, no warning.
-  `sysl … -v` prints which pair was adopted, and is the way to check.
+  what makes it useful for sizing `configTOTAL_HEAP_SIZE`. **This needs sysl 0.0.47 or newer if you
+  reach the package by `--lib`** — before that only a `dependencies` coordinate adopted the declared
+  allocator, and a `--lib` consumer's own allocations came from libc instead: two heaps, and nothing
+  said so. `sysl … -v` prints the pair that was adopted, which is how to check on any version.
 - **A fully static application still works.** With `configSUPPORT_DYNAMIC_ALLOCATION 0` there is no
   `pvPortMalloc` to link against — and a program that allocates nothing never references it, so nothing
   goes wrong. Use `task_static`, `queue_static` and the `*_static` semaphores, and `@no_alloc` to have
