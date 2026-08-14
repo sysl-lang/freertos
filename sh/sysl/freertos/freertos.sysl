@@ -20,9 +20,16 @@ module sh.sysl.freertos
 //
 // **These are the kernel's, not this package's.** `TickType_t` is 16 bits under
 // `configUSE_16_BIT_TICKS`, 32 on a Cortex-M and 64 on the POSIX port; `BaseType_t` is the port's
-// word and `UBaseType_t` its unsigned half. Every signature here spells them by name, so what an
+// word and `UBaseType_t` its unsigned half; `configSTACK_DEPTH_TYPE` is a `uint16_t` unless the
+// application says otherwise, which is the one of the four that is *not* a machine word and the one
+// a guess is most likely to be wrong about. Every signature here spells them by name, so what an
 // `extern` declares is what the kernel you built exports -- on the configuration you built it with,
 // rather than on the ones somebody thought of.
+//
+// A value a *program* worked out reaches them through the type's own name -- `Stack(stack.len)` --
+// which is the only portable spelling: the measured width is the target's, so naming `u16` or `u32`
+// here would be writing one configuration's answer into the package. That conversion is checked and
+// needs sysl 0.0.54.
 //
 // This package spelled all three `usize`/`isize` until 0.3.0 and proved the guess with an `@assert`
 // over `sizeof`. That was right on every configuration anyone ships and it was still a proof of a
@@ -32,6 +39,7 @@ c type
     Tick  = "TickType_t"
     Base  = "BaseType_t"
     UBase = "UBaseType_t"
+    Stack = "configSTACK_DEPTH_TYPE"
 
 // What the kernel measures itself in, read from the config that built it.
 //

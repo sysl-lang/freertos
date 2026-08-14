@@ -42,14 +42,14 @@ struct Timer
      * A `set_period` that has been queued but not yet acted on is not reflected here, for the reason
      * at the top of the file -- this reads the timer, and the command is still on the daemon's queue.
      */
-    period -> usize = c_timer_period(self.handle)
+    period -> Tick = c_timer_period(self.handle)
 
     /** The tick count at which this timer next expires.
      *
      * Only meaningful while `is_active`; a dormant timer's expiry time is whatever it was left at.
      * Like every tick count it wraps, so compare by subtraction rather than by ordering.
      */
-    expiry -> usize = c_timer_expiry(self.handle)
+    expiry -> Tick = c_timer_expiry(self.handle)
 
     /** Whether the timer is running -- created-and-started, and not yet expired if it is one-shot.
      *
@@ -65,7 +65,7 @@ struct Timer
      */
     auto_reload -> bool = c_timer_reload(self.handle) == yes
 
-    set_auto_reload(self, on: bool) = c_timer_set_reload(self.handle, if on then yes else 0)
+    set_auto_reload(self, on: bool) = c_timer_set_reload(self.handle, if on then yes else no)
 
     /** The pointer handed to `timer` at creation, which the callback reads to know which timer it is.
      *
@@ -91,19 +91,19 @@ struct Timer
      * right answer almost always, and `false` means the queue was full rather than anything about the
      * timer. Starting an already-running timer is `reset`.
      */
-    start(self, wait: usize) -> bool =
+    start(self, wait: Tick) -> bool =
         c_timer_command(self.handle, cmd_start, c_tick_count(), null, wait) == pass
 
     /** Stop the timer, leaving it dormant. Starting it again begins a fresh period.
      */
-    stop(self, wait: usize) -> bool = c_timer_command(self.handle, cmd_stop, 0, null, wait) == pass
+    stop(self, wait: Tick) -> bool = c_timer_command(self.handle, cmd_stop, 0, null, wait) == pass
 
     /** Begin the period again from now, whether or not the timer was running.
      *
      * The debounce operation: reset on every event and the callback runs once, one period after the
      * last of them. A reset on a dormant timer starts it.
      */
-    reset(self, wait: usize) -> bool =
+    reset(self, wait: Tick) -> bool =
         c_timer_command(self.handle, cmd_reset, c_tick_count(), null, wait) == pass
 
     /** Change the period, in ticks, and start the timer counting the new one from now.
@@ -112,7 +112,7 @@ struct Timer
      * change-the-period-but-leave-it-dormant command, and a `stop` afterwards is the way to that.
      * A period of zero is refused by the kernel's own `configASSERT`.
      */
-    set_period(self, period: usize, wait: usize) -> bool =
+    set_period(self, period: Tick, wait: Tick) -> bool =
         c_timer_command(self.handle, cmd_change_period, period, null, wait) == pass
 
     /** Delete the timer, freeing what the kernel allocated for it.
@@ -121,7 +121,7 @@ struct Timer
      * this is queued rather than from the moment it returns. A statically created timer's storage is
      * yours and is not touched.
      */
-    delete(self, wait: usize) -> bool =
+    delete(self, wait: Tick) -> bool =
         c_timer_command(self.handle, cmd_delete, 0, null, wait) == pass
 
     /** The same four commands, issued from an interrupt handler.
@@ -142,10 +142,10 @@ struct Timer
     reset_from_isr(self, woken: *bool) -> bool =
         self.command_from_isr(cmd_reset_from_isr, c_tick_count_from_isr(), woken)
 
-    set_period_from_isr(self, period: usize, woken: *bool) -> bool =
+    set_period_from_isr(self, period: Tick, woken: *bool) -> bool =
         self.command_from_isr(cmd_change_period_from_isr, period, woken)
 
-    private[freertos] command_from_isr(self, command: isize, value: usize, woken: *bool) -> bool
+    private[freertos] command_from_isr(self, command: Cmd, value: Tick, woken: *bool) -> bool
         var raw = flag_in(woken)
         val ok = c_timer_command_from_isr(self.handle, command, value, &raw, 0) == pass
 
@@ -188,22 +188,29 @@ c const
     // at. A callback cannot preempt a task above this, and a task below it cannot preempt a callback.
     timer_task_priority: usize = "configTIMER_TASK_PRIORITY"
 
+// What a command number is to the kernel. `BaseType_t` again -- a `c const` is measured against its
+// own file, so the type has to be named where the constants are, and naming it for the role it plays
+// here reads better than a second `Base` would. Two transparent subtypes of one integer are one
+// integer, so a `Cmd` goes wherever a `Base` does.
+c type
+    Cmd = "BaseType_t"
+
 // The commands the daemon understands. Every one is a `#define` in `timers.h` and the function that
 // carries them is real, which is the shape `c const` exists for -- `xTimerStart` and the rest are
 // macros over `xTimerGenericCommand` with the command number filled in, and nothing else.
 private[freertos] c const
-    cmd_start: isize         = "tmrCOMMAND_START"
-    cmd_stop: isize          = "tmrCOMMAND_STOP"
-    cmd_reset: isize         = "tmrCOMMAND_RESET"
-    cmd_change_period: isize = "tmrCOMMAND_CHANGE_PERIOD"
-    cmd_delete: isize        = "tmrCOMMAND_DELETE"
+    cmd_start: Cmd         = "tmrCOMMAND_START"
+    cmd_stop: Cmd          = "tmrCOMMAND_STOP"
+    cmd_reset: Cmd         = "tmrCOMMAND_RESET"
+    cmd_change_period: Cmd = "tmrCOMMAND_CHANGE_PERIOD"
+    cmd_delete: Cmd        = "tmrCOMMAND_DELETE"
 
     // Distinct numbers rather than the same ones, because the daemon reads them to know which clock
     // the command's *now* was taken from. There is no delete-from-ISR: freeing is unbounded work.
-    cmd_start_from_isr: isize         = "tmrCOMMAND_START_FROM_ISR"
-    cmd_stop_from_isr: isize          = "tmrCOMMAND_STOP_FROM_ISR"
-    cmd_reset_from_isr: isize         = "tmrCOMMAND_RESET_FROM_ISR"
-    cmd_change_period_from_isr: isize = "tmrCOMMAND_CHANGE_PERIOD_FROM_ISR"
+    cmd_start_from_isr: Cmd         = "tmrCOMMAND_START_FROM_ISR"
+    cmd_stop_from_isr: Cmd          = "tmrCOMMAND_STOP_FROM_ISR"
+    cmd_reset_from_isr: Cmd         = "tmrCOMMAND_RESET_FROM_ISR"
+    cmd_change_period_from_isr: Cmd = "tmrCOMMAND_CHANGE_PERIOD_FROM_ISR"
 
 /** Create a timer from the kernel's heap, `None` if there is not enough of it.
  *
@@ -231,7 +238,7 @@ private[freertos] c const
  * Needs `configUSE_TIMERS 1`, without which the kernel compiles no daemon and this does not link.
  */
 @crossing(id)
-timer[T](name: string, period: usize, auto_reload: bool, id: *T,
+timer[T](name: string, period: Tick, auto_reload: bool, id: *T,
          callback: *extern(*TimerControl) -> unit) -> Option[Timer]
     var buf: [name_len]u8 = [0; name_len]
 
@@ -255,7 +262,7 @@ end timer
  * Needs `configSUPPORT_STATIC_ALLOCATION 1`, and with it a program has timers and no heap at all.
  */
 @crossing(id)
-timer_static[T](name: string, period: usize, auto_reload: bool, id: *T,
+timer_static[T](name: string, period: Tick, auto_reload: bool, id: *T,
                 callback: *extern(*TimerControl) -> unit, control: []usize) -> Option[Timer]
     if control.len < timer_words then return None
 
@@ -290,30 +297,30 @@ timer_daemon() -> Option[Task]
 // Not public: a program gets this by starting the scheduler, and calling it twice creates a second
 // daemon. What it is here for is the package's own tests, which never start a scheduler and still
 // need a queue for a command to land on.
-private[freertos] extern "xTimerCreateTimerTask" c_timer_create_daemon() -> isize
+private[freertos] extern "xTimerCreateTimerTask" c_timer_create_daemon() -> Base
 
 private[freertos] extern "xTimerCreate" c_timer_create(
-    name: *u8, period: usize, auto_reload: isize, id: *u8,
+    name: *u8, period: Tick, auto_reload: Base, id: *u8,
     callback: *extern(*TimerControl) -> unit) -> *TimerControl
 
 private[freertos] extern "xTimerCreateStatic" c_timer_create_static(
-    name: *u8, period: usize, auto_reload: isize, id: *u8,
+    name: *u8, period: Tick, auto_reload: Base, id: *u8,
     callback: *extern(*TimerControl) -> unit, control: *u8) -> *TimerControl
 
 private[freertos] extern "xTimerGenericCommandFromTask" c_timer_command(t: *TimerControl,
-                                                                        command: isize,
-                                                                        value: usize,
-                                                                        woken: *isize,
-                                                                        wait: usize) -> isize
+                                                                        command: Cmd,
+                                                                        value: Tick,
+                                                                        woken: *Base,
+                                                                        wait: Tick) -> Base
 
 private[freertos] extern "xTimerGenericCommandFromISR" c_timer_command_from_isr(
-    t: *TimerControl, command: isize, value: usize, woken: *isize, wait: usize) -> isize
+    t: *TimerControl, command: Cmd, value: Tick, woken: *Base, wait: Tick) -> Base
 
-private[freertos] extern "xTimerIsTimerActive" c_timer_is_active(t: *TimerControl) -> isize
-private[freertos] extern "xTimerGetPeriod" c_timer_period(t: *TimerControl) -> usize
-private[freertos] extern "xTimerGetExpiryTime" c_timer_expiry(t: *TimerControl) -> usize
-private[freertos] extern "xTimerGetReloadMode" c_timer_reload(t: *TimerControl) -> isize
-private[freertos] extern "vTimerSetReloadMode" c_timer_set_reload(t: *TimerControl, on: isize)
+private[freertos] extern "xTimerIsTimerActive" c_timer_is_active(t: *TimerControl) -> Base
+private[freertos] extern "xTimerGetPeriod" c_timer_period(t: *TimerControl) -> Tick
+private[freertos] extern "xTimerGetExpiryTime" c_timer_expiry(t: *TimerControl) -> Tick
+private[freertos] extern "xTimerGetReloadMode" c_timer_reload(t: *TimerControl) -> Base
+private[freertos] extern "vTimerSetReloadMode" c_timer_set_reload(t: *TimerControl, on: Base)
 private[freertos] extern "pvTimerGetTimerID" c_timer_id(t: *TimerControl) -> *u8
 private[freertos] extern "vTimerSetTimerID" c_timer_set_id(t: *TimerControl, id: *u8)
 private[freertos] extern "xTimerGetTimerDaemonTaskHandle" c_timer_daemon() -> *TaskControlBlock

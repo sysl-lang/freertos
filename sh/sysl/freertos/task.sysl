@@ -68,9 +68,9 @@ struct Task
      * `priority` reports the raised figure while `base_priority` reports the task's own. A task
      * holding no mutex answers the same for both.
      */
-    priority -> usize = c_task_priority(self.handle)
+    priority -> usize = usize(c_task_priority(self.handle))
 
-    base_priority -> usize = c_task_base_priority(self.handle)
+    base_priority -> usize = usize(c_task_base_priority(self.handle))
 
     /** Where the scheduler thinks this task is.
      *
@@ -98,7 +98,7 @@ struct Task
      * Needs `INCLUDE_uxTaskGetStackHighWaterMark 1`, and it is the number to look at before trimming
      * a stack.
      */
-    stack_high_water -> usize = c_task_high_water(self.handle)
+    stack_high_water -> usize = usize(c_task_high_water(self.handle))
 
     /** Delete this task, freeing what the kernel allocated for it.
      *
@@ -120,7 +120,7 @@ struct Task
 
     resume(self) = c_task_resume(self.handle)
 
-    set_priority(self, priority: usize) = c_task_set_priority(self.handle, priority)
+    set_priority(self, priority: usize) = c_task_set_priority(self.handle, UBase(priority))
 
     /** Add one to this task's notification value, waking it if it is waiting.
      *
@@ -185,17 +185,25 @@ private[freertos] c const
 c const
     task_words: usize = "(sizeof(StaticTask_t) + sizeof(StackType_t) - 1) / sizeof(StackType_t)"
 
+// The two kernel enums this file crosses, measured rather than assumed. C leaves an enum's underlying
+// integer to the implementation -- and to its flags, which is why a package's own C and the kernel's
+// have to be compiled the same way -- so a signature spelling one `isize` is a guess in the same
+// shape as spelling a tick one.
+c type
+    Action = "eNotifyAction"
+    State  = "eTaskState"
+
 // The `eNotifyAction` an `xTaskGenericNotify` carries, and the `eTaskState` one comes back as. These
 // are enumerators rather than macros, and a C expression naming one is still a C expression, so
 // `c const` reads them exactly as it reads a `#define`.
 private[freertos] c const
-    action_set_bits: isize  = "eSetBits"
-    action_increment: isize = "eIncrement"
-    state_running: isize    = "eRunning"
-    state_ready: isize      = "eReady"
-    state_blocked: isize    = "eBlocked"
-    state_suspended: isize  = "eSuspended"
-    state_deleted: isize    = "eDeleted"
+    action_set_bits: Action  = "eSetBits"
+    action_increment: Action = "eIncrement"
+    state_running: State     = "eRunning"
+    state_ready: State       = "eReady"
+    state_blocked: State     = "eBlocked"
+    state_suspended: State   = "eSuspended"
+    state_deleted: State     = "eDeleted"
 
 /** Create a task from the kernel's heap, `None` if there is not enough of it.
  *
@@ -227,7 +235,8 @@ task[T](name: string, stack_words: usize, priority: usize, body: *extern(*T) -> 
 
     write_name(name, &buf[0])
 
-    val made = c_task_create(ptr_cast(body), &buf[0], stack_words, ptr_cast(arg), priority, &handle)
+    val made = c_task_create(ptr_cast(body), &buf[0], Stack(stack_words), ptr_cast(arg),
+                             UBase(priority), &handle)
 
     if made != pass then
         None
@@ -263,8 +272,8 @@ task_static[T](name: string, stack: []usize, tcb: []usize, priority: usize,
 
     write_name(name, &buf[0])
 
-    val handle = c_task_create_static(ptr_cast(body), &buf[0], stack.len, ptr_cast(arg), priority,
-                                      as_mut_ptr(stack), ptr_cast(as_mut_ptr(tcb)))
+    val handle = c_task_create_static(ptr_cast(body), &buf[0], Stack(stack.len), ptr_cast(arg),
+                                      UBase(priority), as_mut_ptr(stack), ptr_cast(as_mut_ptr(tcb)))
 
     if handle == null then None else Some(Task(handle))
 end task_static
@@ -286,7 +295,7 @@ current() -> Task = Task(c_current_task())
  * A delay measures from *now*, so a loop that works and then delays drifts by however long the work
  * took. `delay_until` is the one that does not.
  */
-delay(ticks: usize) = c_task_delay(ticks)
+delay(ticks: Tick) = c_task_delay(ticks)
 
 yield_now() = c_task_delay(0)
 
@@ -305,7 +314,7 @@ yield_now() = c_task_delay(0)
  * the interval -- and in that case it returns immediately rather than blocking for nearly a whole
  * wrap. It is the only honest way to notice you are not keeping up.
  */
-delay_until(last: *usize, interval: usize) -> bool = c_task_delay_until(last, interval) == yes
+delay_until(last: *Tick, interval: Tick) -> bool = c_task_delay_until(last, interval) == yes
 
 /** Wait for a notification and take it, which is a counting semaphore that costs no object.
  *
@@ -317,7 +326,7 @@ delay_until(last: *usize, interval: usize) -> bool = c_task_delay_until(last, in
  * binary signal, and `false` decrements it, which makes it a counter. What comes back is the value
  * as it was before either happened, so zero means the wait timed out.
  */
-notify_take(clear: bool, wait: usize) -> u32 = c_notify_take(0, if clear then yes else 0, wait)
+notify_take(clear: bool, wait: Tick) -> u32 = c_notify_take(0, if clear then yes else no, wait)
 
 /** Wait for a notification without consuming it, and read the value.
  *
@@ -325,7 +334,7 @@ notify_take(clear: bool, wait: usize) -> u32 = c_notify_take(0, if clear then ye
  * `clear_on_exit` after, so `notify_wait(0, 0xFFFFFFFF, &v, forever)` is *wait for any bit, tell me
  * which, and reset*. `false` means the wait timed out and `value` was not written.
  */
-notify_wait(clear_on_entry: u32, clear_on_exit: u32, value: *u32, wait: usize) -> bool =
+notify_wait(clear_on_entry: u32, clear_on_exit: u32, value: *u32, wait: Tick) -> bool =
     c_notify_wait(0, clear_on_entry, clear_on_exit, value, wait) == yes
 
 // Copy a name into a fixed buffer the kernel reads during the create call, terminator included.
@@ -338,41 +347,41 @@ private[freertos] write_name(name: string, into: *u8)
     for i in 0..<n do into[i] = name.bytes[i]
 
 private[freertos] extern "xTaskCreate" c_task_create(body: *extern(*u8) -> unit, name: *u8,
-                                                     depth: usize, arg: *u8, priority: usize,
-                                                     into: **TaskControlBlock) -> isize
+                                                     depth: Stack, arg: *u8, priority: UBase,
+                                                     into: **TaskControlBlock) -> Base
 
 private[freertos] extern "xTaskCreateStatic" c_task_create_static(body: *extern(*u8) -> unit,
-                                                                  name: *u8, depth: usize, arg: *u8,
-                                                                  priority: usize, stack: *usize,
+                                                                  name: *u8, depth: Stack, arg: *u8,
+                                                                  priority: UBase, stack: *usize,
                                                                   tcb: *u8) -> *TaskControlBlock
 
 private[freertos] extern "vTaskDelete" c_task_delete(t: *TaskControlBlock)
 private[freertos] extern "vTaskSuspend" c_task_suspend(t: *TaskControlBlock)
 private[freertos] extern "vTaskResume" c_task_resume(t: *TaskControlBlock)
-private[freertos] extern "vTaskDelay" c_task_delay(ticks: usize)
-private[freertos] extern "xTaskDelayUntil" c_task_delay_until(last: *usize, interval: usize) -> isize
-private[freertos] extern "uxTaskPriorityGet" c_task_priority(t: *TaskControlBlock) -> usize
-private[freertos] extern "uxTaskBasePriorityGet" c_task_base_priority(t: *TaskControlBlock) -> usize
-private[freertos] extern "vTaskPrioritySet" c_task_set_priority(t: *TaskControlBlock, priority: usize)
-private[freertos] extern "eTaskGetState" c_task_state(t: *TaskControlBlock) -> isize
-private[freertos] extern "uxTaskGetStackHighWaterMark" c_task_high_water(t: *TaskControlBlock) -> usize
+private[freertos] extern "vTaskDelay" c_task_delay(ticks: Tick)
+private[freertos] extern "xTaskDelayUntil" c_task_delay_until(last: *Tick, interval: Tick) -> Base
+private[freertos] extern "uxTaskPriorityGet" c_task_priority(t: *TaskControlBlock) -> UBase
+private[freertos] extern "uxTaskBasePriorityGet" c_task_base_priority(t: *TaskControlBlock) -> UBase
+private[freertos] extern "vTaskPrioritySet" c_task_set_priority(t: *TaskControlBlock, priority: UBase)
+private[freertos] extern "eTaskGetState" c_task_state(t: *TaskControlBlock) -> State
+private[freertos] extern "uxTaskGetStackHighWaterMark" c_task_high_water(t: *TaskControlBlock) -> UBase
 private[freertos] extern "xTaskGetCurrentTaskHandle" c_current_task() -> *TaskControlBlock
 
-private[freertos] extern "xTaskGenericNotify" c_notify(t: *TaskControlBlock, index: usize, value: u32,
-                                                       action: isize, previous: *u32) -> isize
+private[freertos] extern "xTaskGenericNotify" c_notify(t: *TaskControlBlock, index: UBase, value: u32,
+                                                       action: Action, previous: *u32) -> Base
 
-private[freertos] extern "ulTaskGenericNotifyTake" c_notify_take(index: usize, clear: isize,
-                                                                 wait: usize) -> u32
+private[freertos] extern "ulTaskGenericNotifyTake" c_notify_take(index: UBase, clear: Base,
+                                                                 wait: Tick) -> u32
 
-private[freertos] extern "xTaskGenericNotifyWait" c_notify_wait(index: usize, on_entry: u32,
+private[freertos] extern "xTaskGenericNotifyWait" c_notify_wait(index: UBase, on_entry: u32,
                                                                 on_exit: u32, value: *u32,
-                                                                wait: usize) -> isize
+                                                                wait: Tick) -> Base
 
 private[freertos] extern "vTaskGenericNotifyGiveFromISR" c_notify_give_from_isr(
-    t: *TaskControlBlock, index: usize, woken: *isize)
+    t: *TaskControlBlock, index: UBase, woken: *Base)
 
 private[freertos] extern "xTaskGenericNotifyFromISR" c_notify_from_isr(
-    t: *TaskControlBlock, index: usize, value: u32, action: isize, previous: *u32,
-    woken: *isize) -> isize
+    t: *TaskControlBlock, index: UBase, value: u32, action: Action, previous: *u32,
+    woken: *Base) -> Base
 
-private[freertos] extern "xTaskResumeFromISR" c_task_resume_from_isr(t: *TaskControlBlock) -> isize
+private[freertos] extern "xTaskResumeFromISR" c_task_resume_from_isr(t: *TaskControlBlock) -> Base

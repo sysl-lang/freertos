@@ -106,6 +106,36 @@ static_task_storage_too_small_for_a_control_block_is_refused() =
            "one word is not a control block, and handing it over would have the kernel write past it")
 
 @test
+a_depth_and_a_priority_the_program_worked_out_reach_the_kernel() =
+    // The kernel's depth argument is a `configSTACK_DEPTH_TYPE` and its priority a `UBaseType_t`, so
+    // neither is a machine word by definition -- the first is a `uint16_t` unless the application
+    // says otherwise. What a caller has is arithmetic: a multiple of `min_stack`, a priority below
+    // the ceiling, the length of storage it owns. Those cross into the measured types through the
+    // types' own names inside this package, which is the only portable spelling there is, and this
+    // is what says the values arrive rather than being truncated on the way.
+    val depth = min_stack * 2
+    val p = usize(max_priorities) - 2
+
+    val made = task("computed", depth, p, &idle_body, no_arg)
+    val t = made.expect("twice the minimum stack fits in the test heap")
+
+    assert(t.priority == p, "the priority the caller worked out is the priority the kernel kept")
+
+    t.delete()
+
+    // The static form takes its depth from the storage rather than from an argument, which is the
+    // same conversion reached from a slice's `len`.
+    val made_static = task_static("computed", static_stack[0..<512], static_tcb[0..<task_words], p,
+                                  &idle_body, no_arg)
+    val s = made_static.expect("512 words and a control block is a task")
+
+    assert(s.priority == p, "and a statically created one keeps it too")
+    assert(s.stack_high_water > 0, "with the 512 words its storage says rather than a truncation")
+
+    s.delete()
+end a_depth_and_a_priority_the_program_worked_out_reach_the_kernel
+
+@test
 a_task_is_handed_a_typed_address_rather_than_a_byte_pointer() =
     // `task` is generic in what its body reads, and `@crossing(arg)` is what makes that worth having:
     // whatever `arg` points at is walked at this call, so a state holding a plain `&T` is refused here

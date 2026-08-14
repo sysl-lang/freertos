@@ -80,17 +80,35 @@ config here and being useless to anybody whose board wants a different tick rate
 So: you build the kernel, and sysl compiles this against the same headers and links what you built.
 [`pico2`](https://github.com/sysl-lang/pico2) has the same shape for the same kind of reason.
 
-**What keeps it honest is `c const`.** Every size and every macro constant this binding needs is a C
-expression evaluated by clang against your headers on every build — `sizeof(StaticTask_t)`,
-`portMAX_DELAY`, `configTICK_RATE_HZ`, `queueSEND_TO_BACK` — rather than a number somebody copied here
-once. And where a width could differ in a way that would link and then be wrong, an `@assert` refuses
-the build and names the config option to look at:
+**What keeps it honest is `c const` and `c type`.** Every size and every macro constant this binding
+needs is a C expression evaluated by clang against your headers on every build —
+`sizeof(StaticTask_t)`, `portMAX_DELAY`, `configTICK_RATE_HZ`, `queueSEND_TO_BACK` — rather than a
+number somebody copied here once. And every kernel type that reaches a signature is **measured**
+rather than guessed:
 
 ```
-error: TickType_t is not the width of a machine word on this configuration —
-       sh.sysl.freertos spells every tick count 'usize', so it cannot bind this kernel.
-       configUSE_16_BIT_TICKS is the usual cause
+c type
+    Tick  = "TickType_t"
+    Base  = "BaseType_t"
+    UBase = "UBaseType_t"
+    Stack = "configSTACK_DEPTH_TYPE"
 ```
+
+So `delay` takes a `Tick`, `xTaskCreate`'s depth argument is a `Stack`, and an event group's bits are
+an `EventBits_t` — which *is* `TickType_t`, so a 16-bit tick makes them 16 bits wide too. Under
+`configUSE_16_BIT_TICKS 1` this package now works rather than refusing to build, which is what the
+option is for.
+
+Until 0.3.0 all of them were spelled `usize`/`isize`, with three `@assert`s over `sizeof` proving the
+guess. That was right on every configuration anybody ships, and it was still a proof of a guess — the
+one configuration it could not bind was the one the assertion existed to catch. The asserts went with
+the guess they were proving. What stayed is every `@assert` and every `c const` about a *value* or a
+*layout*: `stack_depth_max`, `task_words`, `queue_words` and the rest are not widths.
+
+A number your own program worked out reaches one of these types through the type's own name —
+`Stack(stack.len)`, `UBase(priority)` — which is the only portable spelling there is: the width is
+your target's, so naming `u16` or `u32` would be writing one configuration's answer into your source.
+**That conversion needs sysl 0.0.54 or newer**, which is this package's floor from 0.3.0.
 
 ## What you have to supply
 
