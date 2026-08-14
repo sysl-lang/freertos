@@ -188,9 +188,15 @@ the_kernel_calls_a_sysl_callback_with_the_handle_it_was_asked_about() =
     // first and an opaque context pointer third, which is the shape a timer callback is in. A handle
     // arriving intact here is the proof, and the context pointer covers the argument beside it.
     //
-    // What is *not* in question, because the compiler refuses it outright, is passing the handle as a
-    // `Timer`: a sysl function with an aggregate parameter has no address C can call, and taking one
-    // is an error rather than a miscompile. That refusal is why `timer_of` exists.
+    // Passing the handle as a `Timer` instead was refused outright until 0.0.55, and that refusal is
+    // what `timer_of` was written around. It is gone: an `@export`ed function has a C-convention
+    // entry and `&f` is that entry's address, aggregate parameters and all.
+    //
+    // `timer_of` stays for a different reason, measured rather than assumed -- a one-pointer struct
+    // is classified as `[1 x i32]` on thumb and `i32` on riscv32 where the bare pointer stays `ptr`,
+    // so the by-value form would rest on those landing in the same register rather than on the same
+    // declaration. `timer.sysl` carries the table. What this case checks is unchanged either way: a
+    // handle crossing from C into sysl intact.
     val t = task("probe", min_stack, 1, &idle_body, no_arg).expect("one minimal task fits in the test heap")
 
     probe_expected = t.handle

@@ -156,11 +156,27 @@ end Timer
 
 /** The `Timer` for a handle, which is what a callback does with the one it is given.
  *
- * A callback is a C function pointer and receives the kernel's bare `TimerHandle_t`, because **a sysl
- * function whose parameter is an aggregate has no address C can call** -- an aggregate crosses to C in
- * whichever registers that machine's convention names, which are not the ones a sysl call uses, and
- * the compiler refuses to take the address rather than letting it go wrong on the board. So the
- * callback takes the pointer and this turns it back into something with methods on it:
+ * **This existed because the compiler refused the alternative, and since 0.0.55 it does not.** A sysl
+ * function with an aggregate parameter had no address C could call, so a callback could only ever be
+ * handed the kernel's bare `TimerHandle_t`. An `@export` publishes a C-convention entry now
+ * (`15 §12`) and `&f` on one is that entry's address, so `tick(t: Timer)` is a callback the kernel
+ * could be given.
+ *
+ * **It stays anyway, and the reason is measured rather than habitual.** A `Timer` is one pointer in a
+ * struct, so the by-value form is available only where `{*TimerControl}` is classified the way
+ * `*TimerControl` is -- and it is not, on the cores this package exists for. The same two exports
+ * through `emit-llvm`, by target:
+ *
+ *     aarch64-macos, x86_64-linux    ptr           ptr
+ *     thumbv7m, thumbv6m             [1 x i32]     ptr
+ *     riscv32                        i32           ptr
+ *
+ * Both land in the same register on every one of them, so a by-value callback would work today. It
+ * would also be resting on a coincidence rather than on the same declaration, while asking the kernel
+ * to call through a function pointer whose C type says `TimerHandle_t`. A binding whose whole point is
+ * the bottom two rows should not take that bet.
+ *
+ * So the callback takes the pointer and this turns it back into something with methods on it:
  *
  *     tick(handle: *TimerControl)
  *         val t = timer_of(handle)
