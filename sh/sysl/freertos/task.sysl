@@ -11,12 +11,32 @@ import sysl.slices.as_mut_ptr
 // from the kernel's heap and `task_static` from storage you own; either way nothing runs until
 // `start` is called, and after that the highest-priority ready task runs.
 //
-// **A task body is a C function pointer, not a closure.** `*extern(*u8) -> unit` is the shape,
-// which is `TaskFunction_t` exactly. A closure cannot be one: it would have to be boxed, and its
-// captures would be values crossing into another domain, which is what `06`'s crossing rules are
-// about. What a body gets instead is the `*u8` handed to `task`, which is an address -- and whatever
-// is at that address is shared, so those rules apply to it. A plain `&T` may not cross; `&sync T`
-// may.
+// **A task body is a C function pointer, not a closure.** `*extern(*T) -> unit` is the shape, which
+// is `TaskFunction_t` with the argument's type kept rather than thrown away. A closure cannot be one:
+// it would have to be boxed, and its captures would be values crossing into another domain, which is
+// what `06`'s crossing rules are about. What a body gets instead is the address handed to `task` --
+// and whatever is at that address is shared, so those rules apply to it. A plain `&T` may not cross;
+// `&sync T` may.
+//
+// **`task` and `task_static` are generic in that type and marked `@crossing(arg)`, so the compiler
+// says that rather than this comment.** The kernel's parameter is a `void *` and this package's was a
+// `*u8`, which made the annotation useless: the walk that looks through the pointer would have found
+// a byte and passed. Keeping `T` on the signature is what gives it something to walk, and it costs a
+// caller nothing -- `T` is read off the body, so `task("w", 256, 2, &worker, &state)` is the whole of
+// the call.
+
+/** The address to hand a body that reads nothing, which is the kernel's own `NULL` parameter.
+ *
+ * **`null` cannot be written at any of these calls, and that is the language rather than this
+ * package.** A bare `null` takes its type from its context, and the context at a `@crossing`
+ * parameter is the `*T` being inferred -- so it has none, and the compiler says so. A named constant
+ * of a concrete type settles `T` at `u8` and reads better than the `null` it replaces: it says *this
+ * task is handed nothing* rather than *this task is handed a null pointer*.
+ *
+ * It is also worth reaching for rarely. A body with something to read is handed the address of what
+ * it reads, and that is the call the crossing rule can say anything about.
+ */
+val no_arg: *u8 = ptr_cast(0usize)
 
 // What the kernel calls a task. Only ever held by pointer: its size is the kernel's business and its
 // contents are the scheduler's.
@@ -181,7 +201,11 @@ private[freertos] c const
  *
  * `stack_words` is a count of `StackType_t`, not of bytes -- the kernel's own convention -- and
  * `min_stack` is the floor below which the port cannot run a task at all. `arg` is handed to the
- * body as its only parameter and may be `null`.
+ * body as its only parameter, and `no_arg` is what a body with nothing to read is given.
+ *
+ * **`arg` is `@crossing`**, so whatever it points at is walked at this call and a plain `&T` anywhere
+ * inside it is refused with the `&sync T` it should have been. That is `06`'s rule about what may
+ * reach another concurrency domain, and a task is one; see the top of this file.
  *
  * The name is copied into the task's control block, so nothing here allocates and the string need
  * not outlive the call. A name longer than `configMAX_TASK_NAME_LEN - 1` bytes is truncated, exactly
@@ -193,8 +217,9 @@ private[freertos] c const
  * would truncate the depth and hand back a task with a fraction of the stack asked for -- which runs,
  * and then overflows somewhere with nothing to connect it to this call.
  */
-task(name: string, stack_words: usize, priority: usize, body: *extern(*u8) -> unit,
-     arg: *u8) -> Option[Task]
+@crossing(arg)
+task[T](name: string, stack_words: usize, priority: usize, body: *extern(*T) -> unit,
+        arg: *T) -> Option[Task]
     if stack_words > stack_depth_max then return None
 
     var buf: [name_len]u8 = [0; name_len]
@@ -202,7 +227,9 @@ task(name: string, stack_words: usize, priority: usize, body: *extern(*u8) -> un
 
     write_name(name, &buf[0])
 
-    if c_task_create(body, &buf[0], stack_words, arg, priority, &handle) != pass then
+    val made = c_task_create(ptr_cast(body), &buf[0], stack_words, ptr_cast(arg), priority, &handle)
+
+    if made != pass then
         None
     else
         Some(Task(handle))
@@ -222,20 +249,21 @@ end task
  *     var stack: [512]usize = [0; 512]
  *     var tcb: [task_words]usize = [0; task_words]
  *
- *     val t = task_static("worker", stack[0..<512], tcb[0..<task_words], 2, &worker, null)
+ *     val t = task_static("worker", stack[0..<512], tcb[0..<task_words], 2, &worker, no_arg)
  *
  * This needs `configSUPPORT_STATIC_ALLOCATION 1`, and it is the whole of what a program needs in
  * order to create a task with no heap at all.
  */
-task_static(name: string, stack: []usize, tcb: []usize, priority: usize,
-            body: *extern(*u8) -> unit, arg: *u8) -> Option[Task]
+@crossing(arg)
+task_static[T](name: string, stack: []usize, tcb: []usize, priority: usize,
+               body: *extern(*T) -> unit, arg: *T) -> Option[Task]
     if stack.len > stack_depth_max || tcb.len < task_words then return None
 
     var buf: [name_len]u8 = [0; name_len]
 
     write_name(name, &buf[0])
 
-    val handle = c_task_create_static(body, &buf[0], stack.len, arg, priority,
+    val handle = c_task_create_static(ptr_cast(body), &buf[0], stack.len, ptr_cast(arg), priority,
                                       as_mut_ptr(stack), ptr_cast(as_mut_ptr(tcb)))
 
     if handle == null then None else Some(Task(handle))

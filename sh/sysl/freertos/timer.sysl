@@ -73,10 +73,17 @@ struct Timer
      * captures: the identity is in the timer rather than in the function. Whatever is at that address
      * is shared with the daemon, so `06`'s crossing rules apply to it exactly as they do to a task's
      * argument -- a plain `&T` may not go here.
+     *
+     * **These two are the pair `@crossing` cannot reach, and it is worth knowing which half is
+     * covered.** No annotation in sysl marks a member, so `set_id` is checked by nothing while
+     * `timer` and `timer_static` are checked at every call. Set the id at creation and the compiler
+     * answers for it; replace it afterwards and this comment is all there is. `id` reads back as a
+     * `*u8` for the same reason -- the type the timer was created with is not recorded anywhere the
+     * kernel could give back.
      */
     id -> *u8 = c_timer_id(self.handle)
 
-    set_id(self, id: *u8) = c_timer_set_id(self.handle, id)
+    set_id[T](self, id: *T) = c_timer_set_id(self.handle, ptr_cast(id))
 
     /** Start the timer, or restart one that is already running, counting from now.
      *
@@ -205,13 +212,17 @@ private[freertos] c const
  *     tick(handle: *TimerControl)
  *         blink()
  *
- *     val t = timer("blink", ticks(500), true, null, &tick).expect("no heap for the timer")
+ *     val t = timer("blink", ticks(500), true, no_arg, &tick).expect("no heap for the timer")
  *
  *     t.start(0)
  *
- * `auto_reload` decides whether it repeats. `id` is handed to the callback through the timer and may
- * be `null`; the name is copied into the timer's own storage, so nothing here allocates on your
- * behalf and the string need not outlive the call.
+ * `auto_reload` decides whether it repeats. `id` is handed to the callback through the timer, and
+ * `no_arg` is what a timer with no identity of its own carries; the name is copied into the timer's
+ * own storage, so nothing here allocates on your behalf and the string need not outlive the call.
+ *
+ * **`id` is `@crossing`**, and the daemon is why: a callback runs on the daemon's task, so whatever
+ * `id` points at is read from a domain that is not this one. It is walked at this call exactly as a
+ * task's argument is, and a plain `&T` anywhere inside it is refused.
  *
  * **The callback is a C function pointer, not a closure** -- the same shape and the same reason as a
  * task body. What it receives is the handle of the timer that expired, which `timer_of` turns back
@@ -219,13 +230,15 @@ private[freertos] c const
  *
  * Needs `configUSE_TIMERS 1`, without which the kernel compiles no daemon and this does not link.
  */
-timer(name: string, period: usize, auto_reload: bool, id: *u8,
-      callback: *extern(*TimerControl) -> unit) -> Option[Timer]
+@crossing(id)
+timer[T](name: string, period: usize, auto_reload: bool, id: *T,
+         callback: *extern(*TimerControl) -> unit) -> Option[Timer]
     var buf: [name_len]u8 = [0; name_len]
 
     write_name(name, &buf[0])
 
-    val handle = c_timer_create(&buf[0], period, if auto_reload then yes else 0, id, callback)
+    val handle = c_timer_create(&buf[0], period, if auto_reload then yes else 0, ptr_cast(id),
+                                callback)
 
     if handle == null then None else Some(Timer(handle))
 end timer
@@ -237,20 +250,21 @@ end timer
  *
  *     var control: [timer_words]usize = [0; timer_words]
  *
- *     val t = timer_static("blink", ticks(500), true, null, &tick, control[0..<timer_words])
+ *     val t = timer_static("blink", ticks(500), true, no_arg, &tick, control[0..<timer_words])
  *
  * Needs `configSUPPORT_STATIC_ALLOCATION 1`, and with it a program has timers and no heap at all.
  */
-timer_static(name: string, period: usize, auto_reload: bool, id: *u8,
-             callback: *extern(*TimerControl) -> unit, control: []usize) -> Option[Timer]
+@crossing(id)
+timer_static[T](name: string, period: usize, auto_reload: bool, id: *T,
+                callback: *extern(*TimerControl) -> unit, control: []usize) -> Option[Timer]
     if control.len < timer_words then return None
 
     var buf: [name_len]u8 = [0; name_len]
 
     write_name(name, &buf[0])
 
-    val handle = c_timer_create_static(&buf[0], period, if auto_reload then yes else 0, id, callback,
-                                       ptr_cast(as_mut_ptr(control)))
+    val handle = c_timer_create_static(&buf[0], period, if auto_reload then yes else 0, ptr_cast(id),
+                                       callback, ptr_cast(as_mut_ptr(control)))
 
     if handle == null then None else Some(Timer(handle))
 end timer_static

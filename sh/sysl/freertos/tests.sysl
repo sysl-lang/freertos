@@ -43,6 +43,30 @@ module sh.sysl.freertos
 // create call will accept.
 private[freertos] idle_body(arg: *u8) = delay(forever)
 
+// The state a task or a timer is handed in the tests that pass one, and the reason it is a named
+// struct rather than the `u32` beside it: `task`, `task_static`, `timer` and `timer_static` are
+// generic in what they carry, so a *typed* address is what a caller now writes and the `void *` is
+// what the kernel gets. A test passing `marker_ptr()` exercises the shape those calls used to have.
+//
+// It crosses because it holds no counts at all. `@crossing` walks whatever is here at every one of
+// those calls, and a `&Carried` field would be refused with the `&sync Carried` it should have been --
+// so the accepting half of that rule is pinned by these files compiling, and the refusing half is a
+// diagnostic no `@test` can assert.
+private[freertos] struct Carried
+    ticks: usize
+    ok: bool
+
+private[freertos] var probe_carried: Carried = Carried(0, false)
+
+// Its address as the untyped pointer the kernel hands back, for the same reason `marker_ptr` exists:
+// `ptr_cast` takes its target type from where its result is read into, and a comparison says nothing
+// about that.
+private[freertos] carried_ptr() -> *u8 = ptr_cast(&probe_carried)
+
+// A task body that reads a typed argument rather than a byte pointer, which is what `task`'s `T` is
+// for. Never scheduled, exactly like `idle_body`.
+private[freertos] carried_body(r: *Carried) = delay(forever)
+
 // -- What one test can see of another ---------------------------------------------------------------
 
 @test
