@@ -57,9 +57,22 @@ private[freertos] c const
 // but they are four names in the headers because they answer four different questions, and reading
 // them out separately means a kernel that ever changed one would be caught here rather than
 // silently agreeing.
+//
+// `no` is here because `Base` is a type now rather than `isize`: `if woken then yes else 0` took the
+// `0` as an `int` and no longer matches its sibling branch, and the kernel's own name for that value
+// is a better answer than an annotation.
 private[freertos] c const
     pass: Base  = "pdPASS"
     yes: Base   = "pdTRUE"
+    no: Base    = "pdFALSE"
+
+// Which end `xQueueGenericSend` puts the item. These belong with `queue.sysl` by subject and are here
+// by rule: a `c const` is measured against its own file, so a constant declared at one of the kernel's
+// types has to sit beside the `c type` block that declares it. `queue.h` is included above for them.
+private[freertos] c const
+    send_to_back: Base   = "queueSEND_TO_BACK"
+    send_to_front: Base  = "queueSEND_TO_FRONT"
+    overwrite_slot: Base = "queueOVERWRITE"
 
 /** How many ticks a duration in milliseconds is, which is what `pdMS_TO_TICKS` does.
  *

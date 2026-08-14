@@ -114,7 +114,7 @@ struct QueueSet
      *
      * A wait of `0` never blocks and is the poll.
      */
-    select(self, wait: usize) -> Option[Selected]
+    select(self, wait: Tick) -> Option[Selected]
         val handle = c_set_select(self.handle, wait)
 
         if handle == null then None else Some(Selected(handle))
@@ -183,10 +183,10 @@ private[freertos] extern "xQueueCreateSetStatic" c_set_create_static(
     capacity: usize, storage: *u8, control: *u8) -> *QueueSetControl
 
 private[freertos] extern "xQueueAddToSet" c_set_add(member: *QueueControl,
-                                                    set: *QueueSetControl) -> isize
+                                                    set: *QueueSetControl) -> Base
 
 private[freertos] extern "xQueueRemoveFromSet" c_set_remove(member: *QueueControl,
-                                                            set: *QueueSetControl) -> isize
+                                                            set: *QueueSetControl) -> Base
 
 private[freertos] extern "xQueueSelectFromSet" c_set_select(set: *QueueSetControl,
-                                                            wait: usize) -> *QueueControl
+                                                            wait: Tick) -> *QueueControl

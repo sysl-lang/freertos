@@ -22,6 +22,14 @@ import sysl.slices.as_mut_ptr
 // are left for a program, and asking for one above that is a programming error the kernel catches
 // with `configASSERT` rather than something this binding can report -- see `wait`.
 
+// A word of event bits, measured out of the header rather than assumed to be a machine word.
+//
+// `EventBits_t` is `TickType_t` in every FreeRTOS there has been, so this follows the tick and is 16
+// bits under `configUSE_16_BIT_TICKS`. It is read out separately anyway, because *bits* and *a count
+// of ticks* are different things to a reader and the kernel is free to stop spelling them the same.
+c type
+    Bits = "EventBits_t"
+
 // What the kernel calls an event group. Only ever held by pointer.
 opaque struct EventGroupControl
 
@@ -36,7 +44,7 @@ struct Events
      * a task that wants to *act* on a combination should `wait` with a timeout of zero, which tests
      * and clears in one step that no other task can get between.
      */
-    bits -> usize = c_event_clear(self.handle, 0)
+    bits -> Bits = c_event_clear(self.handle, 0)
 
     /** Set bits, and answer the group's value at the moment the setting finished.
      *
@@ -47,7 +55,7 @@ struct Events
      *
      * This may not be called from an interrupt: it walks the waiting list, which is unbounded work.
      */
-    set(self, bits: usize) -> usize = c_event_set(self.handle, bits)
+    set(self, bits: Bits) -> Bits = c_event_set(self.handle, bits)
 
     /** Clear bits, and answer the group's value as it was *before* the clearing.
      *
@@ -55,7 +63,7 @@ struct Events
      * answers before, because in each case that is the value that carries the information. Reading a
      * bit out of what `clear` returns is how a task takes an event exactly once.
      */
-    clear(self, bits: usize) -> usize = c_event_clear(self.handle, bits)
+    clear(self, bits: Bits) -> Bits = c_event_clear(self.handle, bits)
 
     /** Block until some or all of `bits` are set, and answer the group's value at that moment.
      *
@@ -74,8 +82,8 @@ struct Events
      * programming error the kernel refuses with `configASSERT`; this binding cannot report it,
      * because every value of the return type is a legitimate set of bits.
      */
-    wait(self, bits: usize, clear_on_exit: bool, all: bool, wait: usize) -> usize =
-        c_event_wait(self.handle, bits, if clear_on_exit then yes else 0, if all then yes else 0, wait)
+    wait(self, bits: Bits, clear_on_exit: bool, all: bool, wait: Tick) -> Bits =
+        c_event_wait(self.handle, bits, if clear_on_exit then yes else no, if all then yes else no, wait)
 
     /** Set bits, then wait for a whole set of them -- a rendezvous no task can slip past.
      *
@@ -90,7 +98,7 @@ struct Events
      *
      * The answer is read exactly as `wait`'s is, and for the same reason.
      */
-    sync(self, set: usize, wait_for: usize, wait: usize) -> usize =
+    sync(self, set: Bits, wait_for: Bits, wait: Tick) -> Bits =
         c_event_sync(self.handle, set, wait_for, wait)
 
     /** Set bits from an interrupt handler, `false` if the daemon's queue was full.
@@ -114,7 +122,7 @@ struct Events
      *
      * A handler that needs to signal one task with none of this should use a task notification.
      */
-    set_from_isr(self, bits: usize, woken: *bool) -> bool
+    set_from_isr(self, bits: Bits, woken: *bool) -> bool
         var raw = flag_in(woken)
         val ok = c_event_set_from_isr(self.handle, bits, &raw) == pass
 
@@ -126,7 +134,7 @@ struct Events
      *
      * Unlike `set_from_isr` this is immediate: reading takes no lock and wakes nobody.
      */
-    bits_from_isr -> usize = c_event_bits_from_isr(self.handle)
+    bits_from_isr -> Bits = c_event_bits_from_isr(self.handle)
 
     /** Free the group, and whatever the kernel allocated with it.
      *
@@ -175,22 +183,22 @@ end events_static
 
 private[freertos] extern "xEventGroupCreate" c_event_create() -> *EventGroupControl
 private[freertos] extern "xEventGroupCreateStatic" c_event_create_static(c: *u8) -> *EventGroupControl
-private[freertos] extern "xEventGroupSetBits" c_event_set(g: *EventGroupControl, bits: usize) -> usize
+private[freertos] extern "xEventGroupSetBits" c_event_set(g: *EventGroupControl, bits: Bits) -> Bits
 private[freertos] extern "xEventGroupClearBits" c_event_clear(g: *EventGroupControl,
-                                                              bits: usize) -> usize
+                                                              bits: Bits) -> Bits
 
-private[freertos] extern "xEventGroupWaitBits" c_event_wait(g: *EventGroupControl, bits: usize,
-                                                            clear_on_exit: isize, all: isize,
-                                                            wait: usize) -> usize
+private[freertos] extern "xEventGroupWaitBits" c_event_wait(g: *EventGroupControl, bits: Bits,
+                                                            clear_on_exit: Base, all: Base,
+                                                            wait: Tick) -> Bits
 
-private[freertos] extern "xEventGroupSync" c_event_sync(g: *EventGroupControl, set: usize,
-                                                        wait_for: usize, wait: usize) -> usize
+private[freertos] extern "xEventGroupSync" c_event_sync(g: *EventGroupControl, set: Bits,
+                                                        wait_for: Bits, wait: Tick) -> Bits
 
 private[freertos] extern "vEventGroupDelete" c_event_delete(g: *EventGroupControl)
 
 private[freertos] extern "xEventGroupSetBitsFromISR" c_event_set_from_isr(g: *EventGroupControl,
-                                                                          bits: usize,
-                                                                          woken: *isize) -> isize
+                                                                          bits: Bits,
+                                                                          woken: *Base) -> Base
 
 private[freertos] extern "xEventGroupGetBitsFromISR" c_event_bits_from_isr(
-    g: *EventGroupControl) -> usize
+    g: *EventGroupControl) -> Bits

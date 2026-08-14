@@ -36,23 +36,23 @@ struct Queue
      * for reporting and for a test; not a basis for deciding whether a `send` will block, which is
      * what the `wait` argument is for.
      */
-    waiting -> usize = c_queue_waiting(self.handle)
+    waiting -> usize = usize(c_queue_waiting(self.handle))
 
-    spaces -> usize = c_queue_spaces(self.handle)
+    spaces -> usize = usize(c_queue_spaces(self.handle))
 
     /** How big one slot is, in bytes, which is what was asked for at creation.
      *
      * This is the kernel's own record rather than a copy kept here, which is why a `Queue` is just a
      * handle and why one obtained from C behaves identically.
      */
-    item_size -> usize = c_queue_item_size(self.handle)
+    item_size -> usize = usize(c_queue_item_size(self.handle))
 
     /** How many slots there are.
      *
      * Fixed at creation: a FreeRTOS queue does not grow, which is the property that lets it work with
      * no allocator at all.
      */
-    capacity -> usize = c_queue_capacity(self.handle)
+    capacity -> usize = usize(c_queue_capacity(self.handle))
 
     /** Copy an item onto the back of the queue, waiting up to `wait` ticks for room.
      *
@@ -62,7 +62,7 @@ struct Queue
      * **A sending task may block, so this may not be called from an interrupt** -- nor from inside a
      * critical section, nor with the scheduler suspended, whatever `wait` is.
      */
-    send[T](self, item: T, wait: usize) -> bool
+    send[T](self, item: T, wait: Tick) -> bool
         if sizeof(T) != self.item_size then return false
 
         c_queue_send(self.handle, ptr_cast(&item), wait, send_to_back) == pass
@@ -74,7 +74,7 @@ struct Queue
      * that has to be seen before what is already waiting, which in practice means an error or a
      * shutdown.
      */
-    send_front[T](self, item: T, wait: usize) -> bool
+    send_front[T](self, item: T, wait: Tick) -> bool
         if sizeof(T) != self.item_size then return false
 
         c_queue_send(self.handle, ptr_cast(&item), wait, send_to_front) == pass
@@ -102,7 +102,7 @@ struct Queue
      *
      *     if q.receive(&got, forever) then use(got)
      */
-    receive[T](self, into: *T, wait: usize) -> bool
+    receive[T](self, into: *T, wait: Tick) -> bool
         if sizeof(T) != self.item_size then return false
 
         c_queue_receive(self.handle, ptr_cast(into), wait) == pass
@@ -113,7 +113,7 @@ struct Queue
      * Everything `receive` says applies, except that the item stays where it was -- so two tasks
      * peeking see the same item, and neither has taken it.
      */
-    peek[T](self, into: *T, wait: usize) -> bool
+    peek[T](self, into: *T, wait: Tick) -> bool
         if sizeof(T) != self.item_size then return false
 
         c_queue_peek(self.handle, ptr_cast(into), wait) == pass
@@ -195,7 +195,7 @@ struct Queue
      * Separate functions from their ordinary twins because those may take the kernel's lock on some
      * ports, which a handler may not wait on.
      */
-    waiting_from_isr -> usize = c_queue_waiting_from_isr(self.handle)
+    waiting_from_isr -> usize = usize(c_queue_waiting_from_isr(self.handle))
 
     is_empty_from_isr -> bool = c_queue_is_empty_from_isr(self.handle) == yes
     is_full_from_isr -> bool = c_queue_is_full_from_isr(self.handle) == yes
@@ -213,14 +213,15 @@ end Queue
 c const
     queue_words: usize = "(sizeof(StaticQueue_t) + sizeof(StackType_t) - 1) / sizeof(StackType_t)"
 
-// Which end `xQueueGenericSend` puts the item, and the queue flavour `xQueueGenericCreate` makes.
-// Every one of these is a `#define` in `queue.h` rather than a symbol, which is exactly the half of
-// the macro problem `c const` answers: the function is real and only its discriminator was hidden.
+// The queue flavour `xQueueGenericCreate` makes. A `#define` in `queue.h` rather than a symbol, which
+// is exactly the half of the macro problem `c const` answers: the function is real and only its
+// discriminator was hidden.
+//
+// The three *send positions* are the same shape and are not here: they are `Base`, and a `c const` is
+// measured against its own file, so a constant declared at one of the kernel's types lives beside the
+// `c type` block that declares it -- in `freertos.sysl`.
 private[freertos] c const
-    send_to_back: isize   = "queueSEND_TO_BACK"
-    send_to_front: isize  = "queueSEND_TO_FRONT"
-    overwrite_slot: isize = "queueOVERWRITE"
-    queue_base: u8        = "queueQUEUE_TYPE_BASE"
+    queue_base: u8 = "queueQUEUE_TYPE_BASE"
 
 /** Create a queue from the kernel's heap, `None` if there is not enough of it.
  *
@@ -268,37 +269,37 @@ private[freertos] extern "xQueueGenericCreateStatic" c_queue_create_static(capac
                                                                           control: *u8,
                                                                           kind: u8) -> *QueueControl
 
-private[freertos] extern "xQueueGenericSend" c_queue_send(q: *QueueControl, item: *u8, wait: usize,
-                                                          position: isize) -> isize
+private[freertos] extern "xQueueGenericSend" c_queue_send(q: *QueueControl, item: *u8, wait: Tick,
+                                                          position: Base) -> Base
 
 private[freertos] extern "xQueueGenericSendFromISR" c_queue_send_from_isr(
-    q: *QueueControl, item: *u8, woken: *isize, position: isize) -> isize
+    q: *QueueControl, item: *u8, woken: *Base, position: Base) -> Base
 
 private[freertos] extern "xQueueReceiveFromISR" c_queue_receive_from_isr(
-    q: *QueueControl, into: *u8, woken: *isize) -> isize
+    q: *QueueControl, into: *u8, woken: *Base) -> Base
 
 private[freertos] extern "xQueuePeekFromISR" c_queue_peek_from_isr(q: *QueueControl,
-                                                                   into: *u8) -> isize
+                                                                   into: *u8) -> Base
 
 private[freertos] extern "uxQueueMessagesWaitingFromISR" c_queue_waiting_from_isr(
-    q: *QueueControl) -> usize
+    q: *QueueControl) -> UBase
 
 private[freertos] extern "xQueueIsQueueEmptyFromISR" c_queue_is_empty_from_isr(
-    q: *QueueControl) -> isize
+    q: *QueueControl) -> Base
 
 private[freertos] extern "xQueueIsQueueFullFromISR" c_queue_is_full_from_isr(
-    q: *QueueControl) -> isize
+    q: *QueueControl) -> Base
 
 private[freertos] extern "xQueueReceive" c_queue_receive(q: *QueueControl, into: *u8,
-                                                         wait: usize) -> isize
+                                                         wait: Tick) -> Base
 
-private[freertos] extern "xQueuePeek" c_queue_peek(q: *QueueControl, into: *u8, wait: usize) -> isize
-private[freertos] extern "uxQueueMessagesWaiting" c_queue_waiting(q: *QueueControl) -> usize
-private[freertos] extern "uxQueueSpacesAvailable" c_queue_spaces(q: *QueueControl) -> usize
-private[freertos] extern "uxQueueGetQueueItemSize" c_queue_item_size(q: *QueueControl) -> usize
-private[freertos] extern "uxQueueGetQueueLength" c_queue_capacity(q: *QueueControl) -> usize
+private[freertos] extern "xQueuePeek" c_queue_peek(q: *QueueControl, into: *u8, wait: Tick) -> Base
+private[freertos] extern "uxQueueMessagesWaiting" c_queue_waiting(q: *QueueControl) -> UBase
+private[freertos] extern "uxQueueSpacesAvailable" c_queue_spaces(q: *QueueControl) -> UBase
+private[freertos] extern "uxQueueGetQueueItemSize" c_queue_item_size(q: *QueueControl) -> UBase
+private[freertos] extern "uxQueueGetQueueLength" c_queue_capacity(q: *QueueControl) -> UBase
 private[freertos] extern "xQueueGenericReset" c_queue_reset_generic(q: *QueueControl,
-                                                                   new_queue: isize) -> isize
+                                                                   new_queue: Base) -> Base
 private[freertos] extern "vQueueDelete" c_queue_delete(q: *QueueControl)
 
 // `xQueueReset` is a macro over `xQueueGenericReset` with the second argument fixed, which is the

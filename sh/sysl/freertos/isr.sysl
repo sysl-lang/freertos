@@ -40,22 +40,22 @@ module sh.sysl.freertos
  * **This is the one thing in the package with C behind it**, because `portYIELD_FROM_ISR` is a macro
  * on every port and there is no symbol to bind. `sh/sysl/freertos/yield.c` says the rest.
  */
-yield_from_isr(woken: bool) = c_yield_from_isr(if woken then yes else 0)
+yield_from_isr(woken: bool) = c_yield_from_isr(if woken then yes else no)
 
 /** The tick count, read from an interrupt.
  *
  * A separate function for the same reason everything else here is: the ordinary `tick_count` may take
  * a lock on a port where a tick is not read atomically.
  */
-tick_count_from_isr() -> usize = c_tick_count_from_isr()
+tick_count_from_isr() -> Tick = c_tick_count_from_isr()
 
 // Turn the caller's `bool` into the kernel's `BaseType_t` out-parameter and back again. Every
 // `_from_isr` in this package is written against these two, so that the flag a handler declares is a
-// `bool` rather than an `isize` a reader has to know the encoding of.
-private[freertos] flag_in(woken: *bool) -> isize = if *woken then yes else 0
+// `bool` rather than a `Base` a reader has to know the encoding of.
+private[freertos] flag_in(woken: *bool) -> Base = if *woken then yes else no
 
-private[freertos] flag_out(woken: *bool, raw: isize) =
+private[freertos] flag_out(woken: *bool, raw: Base) =
     if raw == yes then *woken = true
 
-private[freertos] extern "syslFreertosYieldFromISR" c_yield_from_isr(required: isize)
-private[freertos] extern "xTaskGetTickCountFromISR" c_tick_count_from_isr() -> usize
+private[freertos] extern "syslFreertosYieldFromISR" c_yield_from_isr(required: Base)
+private[freertos] extern "xTaskGetTickCountFromISR" c_tick_count_from_isr() -> Tick
