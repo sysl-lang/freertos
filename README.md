@@ -99,7 +99,7 @@ an `EventBits_t` — which *is* `TickType_t`, so a 16-bit tick makes them 16 bit
 `configUSE_16_BIT_TICKS 1` this package now works rather than refusing to build, which is what the
 option is for.
 
-Until 0.3.0 all of them were spelled `usize`/`isize`, with three `@assert`s over `sizeof` proving the
+Until 0.4.0 all of them were spelled `usize`/`isize`, with three `@assert`s over `sizeof` proving the
 guess. That was right on every configuration anybody ships, and it was still a proof of a guess — the
 one configuration it could not bind was the one the assertion existed to catch. The asserts went with
 the guess they were proving. What stayed is every `@assert` and every `c const` about a *value* or a
@@ -108,7 +108,7 @@ the guess they were proving. What stayed is every `@assert` and every `c const` 
 A number your own program worked out reaches one of these types through the type's own name —
 `Stack(stack.len)`, `UBase(priority)` — which is the only portable spelling there is: the width is
 your target's, so naming `u16` or `u32` would be writing one configuration's answer into your source.
-**That conversion needs sysl 0.0.54 or newer**, which is this package's floor from 0.3.0.
+**That conversion needs sysl 0.0.54 or newer**, which is this package's floor from 0.4.0.
 
 ## What you have to supply
 
@@ -405,14 +405,15 @@ would resume first*, not that any of its code has run.
 
 ```hocon
 dependencies {
-  freertos { git = "github.com/sysl-lang/freertos", version = "0.3.0" }
+  freertos { git = "github.com/sysl-lang/freertos", version = "0.4.0" }
 }
 ```
 
 A checkout beside you works too, with `--lib /path/to/freertos` or a `path` dependency.
 
-**Needs sysl 0.0.52 or newer**, which is the release that added `@crossing`. 0.2.0 is the last version
-that builds on anything older, and its `task` takes a `*u8`.
+**Needs sysl 0.0.54 or newer**, which is the release that let a value a program worked out reach a
+measured type. Two older versions are there for older compilers: 0.3.0 wants 0.0.52 for `@crossing`,
+and 0.2.0 builds on anything before that, with a `task` that takes a `*u8`.
 
 ## Licence
 

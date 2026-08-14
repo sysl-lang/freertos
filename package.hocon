@@ -4,11 +4,11 @@
 // This is the block a *consumer* writes to reach this package:
 //
 //     dependencies {
-//       freertos { git = "github.com/sysl-lang/freertos", version = "0.3.0" }
+//       freertos { git = "github.com/sysl-lang/freertos", version = "0.4.0" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is a
-// tag `v0.3.0` on this repository. `--lib` still works and is what a checkout beside you is for.
+// tag `v0.4.0` on this repository. `--lib` still works and is what a checkout beside you is for.
 
 // `name` is the package; the module a program imports is `sh.sysl.freertos`, and the two are
 // deliberately different. The module carries the `sh.sysl.` prefix so that no package claims a
@@ -17,7 +17,7 @@
 
 package {
   name    = "freertos"
-  version = "0.3.0"
+  version = "0.4.0"
 }
 
 // **This package declares and very nearly does not implement.** There is no kernel source here, no
@@ -98,7 +98,7 @@ allocator {
 // prevent. `&sync T` is the spelling that may, and `sysl.sync`'s `Atomic` and `SpinLock` need no
 // capability and are already reachable on a bare machine.
 //
-// **As of 0.3.0 that is a refusal rather than a warning**, and it is why this release breaks a
+// **As of 0.3.0 that is a refusal rather than a warning**, and it is why that release broke a
 // caller. `task`, `task_static`, `timer` and `timer_static` are generic in what they carry and are
 // marked `@crossing`, so the argument's type is walked at every call; they took a `*u8` before, and
 // a `*u8` has thrown the pointee away, so there was nothing for the walk to look at. README.md says
