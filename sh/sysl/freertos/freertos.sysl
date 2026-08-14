@@ -16,55 +16,50 @@ module sh.sysl.freertos
 // `configTICK_RATE_HZ` says it is: `ticks(100)` converts milliseconds where a duration is what you
 // have, and `forever` is the block-until-it-happens answer.
 
+// The kernel's own integer types, measured out of the headers it was built from.
+//
+// **These are the kernel's, not this package's.** `TickType_t` is 16 bits under
+// `configUSE_16_BIT_TICKS`, 32 on a Cortex-M and 64 on the POSIX port; `BaseType_t` is the port's
+// word and `UBaseType_t` its unsigned half. Every signature here spells them by name, so what an
+// `extern` declares is what the kernel you built exports -- on the configuration you built it with,
+// rather than on the ones somebody thought of.
+//
+// This package spelled all three `usize`/`isize` until 0.3.0 and proved the guess with an `@assert`
+// over `sizeof`. That was right on every configuration anyone ships and it was still a proof of a
+// guess: `configUSE_16_BIT_TICKS 1` -- the case the assertion existed to catch -- was a refusal
+// where it should have been a two-byte tick that simply works, which is what the option is for.
+c type
+    Tick  = "TickType_t"
+    Base  = "BaseType_t"
+    UBase = "UBaseType_t"
+
 // What the kernel measures itself in, read from the config that built it.
 //
 // `forever` is `portMAX_DELAY`, and it means *block* rather than *wait a very long time*: the kernel
 // tests for exactly this value and suspends indefinitely, so it is not the same as passing the
 // largest tick count you can spell.
 c const
-    tick_rate: usize      = "configTICK_RATE_HZ"
-    max_priorities: usize = "configMAX_PRIORITIES"
+    tick_rate: Tick       = "configTICK_RATE_HZ"
+    max_priorities: UBase = "configMAX_PRIORITIES"
     min_stack: usize      = "configMINIMAL_STACK_SIZE"
-    forever: usize        = "portMAX_DELAY"
+    forever: Tick         = "portMAX_DELAY"
 
-// The kernel's own integer widths, and the sizes of the storage a static object needs.
+// The largest stack depth `xTaskCreate` can be given. `configSTACK_DEPTH_TYPE` defaults to
+// `uint16_t`, so a depth of 100,000 words silently becomes 34,464 on a default config -- which is
+// why `task` checks against this rather than passing whatever it was handed.
 //
-// **These are not decoration -- they are the check that this binding matches the kernel it is being
-// compiled against.** `TickType_t`, `BaseType_t` and `StackType_t` are all config- and
-// port-dependent: the tick is 16 bits under `configUSE_16_BIT_TICKS`, 32 on a Cortex-M and 64 on
-// the POSIX port. Every signature below spells them `usize`/`isize`, which is right for every
-// configuration sysl has a target for, and the `@assert`s underneath are what turn
-// *right-for-every-config-we-know* into a refusal on the one we did not.
+// It is a *bound on a value* rather than a width, which is why it stays a measured constant while
+// the widths above became types.
 private[freertos] c const
-    tick_bytes: usize   = "sizeof(TickType_t)"
-    base_bytes: usize   = "sizeof(BaseType_t)"
-    ubase_bytes: usize  = "sizeof(UBaseType_t)"
-    stack_bytes: usize  = "sizeof(StackType_t)"
-
-    // The largest stack depth `xTaskCreate` can be given. `configSTACK_DEPTH_TYPE` defaults to
-    // `uint16_t`, so a depth of 100,000 words silently becomes 34,464 on a default config -- which
-    // is why `task` checks against this rather than passing whatever it was handed.
     stack_depth_max: usize = "(configSTACK_DEPTH_TYPE) -1"
-
-// A tick that is not the width of a machine word would make every signature here wrong in a way
-// that links: the caller would pass 64 bits and the kernel read 32, and a timeout would come out as
-// whatever happened to be in the other half.
-@assert(sizeof(usize) == tick_bytes,
-        "TickType_t is not the width of a machine word on this configuration — sh.sysl.freertos spells every tick count 'usize', so it cannot bind this kernel. configUSE_16_BIT_TICKS is the usual cause")
-
-@assert(sizeof(usize) == base_bytes,
-        "BaseType_t is not the width of a machine word on this configuration — sh.sysl.freertos spells every kernel status 'isize', so it cannot bind this kernel")
-
-@assert(sizeof(usize) == ubase_bytes,
-        "UBaseType_t is not the width of a machine word on this configuration — sh.sysl.freertos spells every priority and count 'usize', so it cannot bind this kernel")
 
 // What the kernel answers with. `pdPASS` and `pdTRUE` are both 1 and `pdFAIL` and `pdFALSE` both 0,
 // but they are four names in the headers because they answer four different questions, and reading
 // them out separately means a kernel that ever changed one would be caught here rather than
 // silently agreeing.
 private[freertos] c const
-    pass: isize  = "pdPASS"
-    yes: isize   = "pdTRUE"
+    pass: Base  = "pdPASS"
+    yes: Base   = "pdTRUE"
 
 /** How many ticks a duration in milliseconds is, which is what `pdMS_TO_TICKS` does.
  *
@@ -72,7 +67,7 @@ private[freertos] c const
  * `configTICK_RATE_HZ`, which `c const` has above. The rounding is the kernel's own -- towards zero
  * -- so `ticks(0)` is no wait at all and a duration shorter than a tick is too.
  */
-ticks(ms: usize) -> usize = (ms * tick_rate) / 1000
+ticks(ms: Tick) -> Tick = (ms * tick_rate) / 1000
 
 /** Hand the processor to the scheduler, which does not give it back.
  *
@@ -85,12 +80,12 @@ start() = c_start_scheduler()
 
 /** The tick count since `start`, which wraps.
  *
- * It wraps at `sizeof(usize)` bytes and the kernel does not notice, so a deadline is compared by
+ * It wraps at `sizeof(Tick)` bytes and the kernel does not notice, so a deadline is compared by
  * subtraction rather than by ordering: `now - then >= interval` is right across a wrap and
  * `now >= deadline` is not. `Task.delay_until` is the version of that argument you do not have to
  * make yourself.
  */
-tick_count() -> usize = c_tick_count()
+tick_count() -> Tick = c_tick_count()
 
 /** Stop preemption without disabling interrupts, and let it resume.
  *
@@ -142,9 +137,9 @@ minimum_ever_free_heap() -> usize = c_min_ever_free_heap()
 // functions above buy is that a *program* never has to write one.
 
 private[freertos] extern "vTaskStartScheduler" c_start_scheduler()
-private[freertos] extern "xTaskGetTickCount" c_tick_count() -> usize
+private[freertos] extern "xTaskGetTickCount" c_tick_count() -> Tick
 private[freertos] extern "vTaskSuspendAll" c_suspend_all()
-private[freertos] extern "xTaskResumeAll" c_resume_all() -> isize
+private[freertos] extern "xTaskResumeAll" c_resume_all() -> Base
 private[freertos] extern "vPortEnterCritical" c_enter_critical()
 private[freertos] extern "vPortExitCritical" c_exit_critical()
 private[freertos] extern "xPortGetFreeHeapSize" c_free_heap() -> usize
