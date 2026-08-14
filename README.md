@@ -44,8 +44,8 @@ consumer(arg: *u8)
 import sh.sysl.freertos.*
 import app.*
 
-task("producer", 2048, 2, &producer, null).expect("the producer")
-task("consumer", 2048, 1, &consumer, null).expect("the consumer")
+task("producer", 2048, 2, &producer, no_arg).expect("the producer")
+task("consumer", 2048, 1, &consumer, no_arg).expect("the consumer")
 
 print("starting the scheduler")
 start()
@@ -210,22 +210,54 @@ interrupt handler written in sysl can reach the allocator without anything in th
 allocate, at the line that would have. Naming the allocator says which functions the program uses; it
 says nothing about where they may be called from, and that half is yours.
 
-## Tasks are domains, so the crossing rules apply
+## Tasks are domains, and the compiler now says so
 
 `design/06-concurrency.md`'s rules are language rules and they bind a FreeRTOS task exactly as they bind
-anything else that creates a domain. Nothing in this package can enforce them for you, so:
+anything else that creates a domain:
 
 - **A plain `&T` may not cross into a task.** Its reference count is not atomic, and two tasks releasing
   the last reference to unrelated objects is the race the whole model exists to prevent.
 - **`&sync T` is the spelling that may.** Its counts are genuinely atomic, and `sysl.sync`'s `Atomic` and
   `SpinLock` require no capability at all — they are reachable on a bare machine.
 - **A queue copies**, which is why it is the easy answer: send the *value* and there is no sharing to
-  reason about. A task body's `*u8` is an address, and whatever is at that address is shared.
+  reason about. An address handed to a task is shared, and whatever is at it is what crossed.
+
+**Until 0.3.0 that was a paragraph asking you to be careful, and now it is a refusal.** `task`,
+`task_static`, `timer` and `timer_static` are generic in what they carry and marked `@crossing`, so the
+argument's type is walked at every call:
+
+```
+error: what 'arg' of 'sh.sysl.freertos.task' points at reaches another concurrency domain, so every
+count inside it has to be atomic — but its 'c' reaches a '&Cell', whose count is not. Hold it as a
+'&sync Cell' ('06')
+```
+
+**The type parameter is the whole of what made that possible, and it is why 0.3.0 is a breaking
+release.** These took a `*u8` before, matching `TaskFunction_t`'s own `void *` — and a `*u8` has thrown
+the pointee away, so the walk found a byte and passed whatever you handed it. `T` is read off the body,
+so a caller writes no more than it did:
+
+```sysl
+worker(s: *State) = ...
+
+task("worker", 2048, 2, &worker, &state)   -- State is walked here
+```
+
+Two things change for a caller that was already there. A body written `worker(arg: *u8)` and an argument
+cast by hand still compile and still say nothing — **type the body and the cast goes away**. And **`null`
+can no longer be written at these calls**: a bare `null` takes its type from its context, and the context
+is the `*T` being inferred, so there is none. `no_arg` is the constant to write instead, and it reads
+better than what it replaces — *this task is handed nothing*, rather than *this task is handed a null
+pointer*.
+
+**`Timer.set_id` is the one that is still yours to get right.** No annotation in sysl marks a member, so
+replacing an id after creation is checked by nothing while `timer` is checked at every call. Set it at
+creation where you can.
 
 ## Building and testing this package
 
 The suite drives the real kernel: it creates every object the package binds and checks what the kernel
-says about them — 81 tests, one file per object beside the source it covers. **It never starts the
+says about them — 83 tests, one file per object beside the source it covers. **It never starts the
 scheduler**, because `start` does not return. What makes a real suite possible is that every FreeRTOS
 object works before the scheduler runs, and a wait of `0` never blocks.
 
@@ -355,11 +387,14 @@ would resume first*, not that any of its code has run.
 
 ```hocon
 dependencies {
-  freertos { git = "github.com/sysl-lang/freertos", version = "0.2.0" }
+  freertos { git = "github.com/sysl-lang/freertos", version = "0.3.0" }
 }
 ```
 
 A checkout beside you works too, with `--lib /path/to/freertos` or a `path` dependency.
+
+**Needs sysl 0.0.52 or newer**, which is the release that added `@crossing`. 0.2.0 is the last version
+that builds on anything older, and its `task` takes a `*u8`.
 
 ## Licence
 

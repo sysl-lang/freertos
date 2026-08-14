@@ -82,7 +82,7 @@ a_semaphore_given_from_an_interrupt_is_there_to_be_taken() =
 @test
 a_notification_from_an_interrupt_raises_the_target_s_value() =
     // The cheapest signal there is: no object, so nothing to create and nothing to be full.
-    val t = task("probe", min_stack, 1, &idle_body, null).expect("one minimal task fits in the test heap")
+    val t = task("probe", min_stack, 1, &idle_body, no_arg).expect("one minimal task fits in the test heap")
 
     var woken = false
 
@@ -152,7 +152,7 @@ a_timer_command_from_an_interrupt_carries_its_own_command_number() =
     // the daemon reads them to know which clock the command's *now* came from. Swapping the two sets
     // would compile, link, and drift a timer by whatever the two disagreed on -- so this checks the
     // discriminators reach the kernel and are accepted.
-    val t = timer("probe", 100, true, null, &probe_tick).expect("one timer fits in the test heap")
+    val t = timer("probe", 100, true, no_arg, &probe_tick).expect("one timer fits in the test heap")
 
     var woken = false
 
@@ -173,7 +173,7 @@ the_command_queue_is_finite_and_says_so_when_it_is_full() =
     //
     // **This test deliberately leaves the queue full**, because nothing drains it without a running
     // daemon -- and that costs the tests after it nothing, since each gets a kernel of its own.
-    val t = timer("probe", 100, true, null, &probe_tick).expect("one timer fits in the test heap")
+    val t = timer("probe", 100, true, no_arg, &probe_tick).expect("one timer fits in the test heap")
 
     var accepted: usize = 0
 

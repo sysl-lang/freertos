@@ -20,13 +20,13 @@ a_created_task_reports_its_priority_and_is_the_current_one() =
     // task the scheduler would resume first*, not that any of its code has executed: nothing has. A
     // second task created at a priority no higher answers `Ready`, which is what the suspension test
     // relies on.
-    val t = task("probe", min_stack, 2, &idle_body, null).expect("one minimal task fits in the test heap")
+    val t = task("probe", min_stack, 2, &idle_body, no_arg).expect("one minimal task fits in the test heap")
 
     assert(t.priority == 2, "the priority it was created with")
     assert(t.base_priority == 2, "which is also its base, holding no mutex")
     assert(t.state == Running, "and being the first task created, it is the one pxCurrentTCB names")
 
-    val second = task("second", min_stack, 1, &idle_body, null).expect("two minimal tasks fit in the test heap")
+    val second = task("second", min_stack, 1, &idle_body, no_arg).expect("two minimal tasks fit in the test heap")
 
     assert(second.state == Ready, "while a later, no-higher-priority task is merely ready")
 
@@ -36,7 +36,7 @@ end a_created_task_reports_its_priority_and_is_the_current_one
 
 @test
 a_task_s_priority_can_be_changed() =
-    val t = task("probe", min_stack, 2, &idle_body, null).expect("one minimal task fits in the test heap")
+    val t = task("probe", min_stack, 2, &idle_body, no_arg).expect("one minimal task fits in the test heap")
 
     t.set_priority(4)
     assert(t.priority == 4, "the scheduler's figure moved")
@@ -55,8 +55,8 @@ a_suspended_task_says_so() =
     //
     // The anchor's priority is not lower than the suspended task's for the same reason: resuming a task
     // of higher priority than the current one yields, and there is no scheduler to yield to.
-    val anchor = task("anchor", min_stack, 2, &idle_body, null).expect("two minimal tasks fit in the test heap")
-    val t = task("probe", min_stack, 1, &idle_body, null).expect("two minimal tasks fit in the test heap")
+    val anchor = task("anchor", min_stack, 2, &idle_body, no_arg).expect("two minimal tasks fit in the test heap")
+    val t = task("probe", min_stack, 1, &idle_body, no_arg).expect("two minimal tasks fit in the test heap")
 
     t.suspend()
     assert(t.state == Suspended, "suspension is visible")
@@ -72,7 +72,7 @@ a_task_that_never_ran_has_used_none_of_its_stack() =
     // that has not been scheduled should report nearly all of its stack untouched. What this really
     // pins is that the number is a *word count from the far end* rather than bytes used, which is the
     // easy thing to get backwards.
-    val t = task("probe", min_stack, 1, &idle_body, null).expect("one minimal task fits in the test heap")
+    val t = task("probe", min_stack, 1, &idle_body, no_arg).expect("one minimal task fits in the test heap")
 
     assert(t.stack_high_water > 0, "an unrun task has never come close to its limit")
 
@@ -84,7 +84,7 @@ a_stack_depth_that_would_not_fit_the_config_s_type_is_refused() =
     // simply passed on -- a task with a third of the stack it asked for, which runs and then overflows
     // somewhere unrelated. Refusing is the only answer that reaches the caller.
     if stack_depth_max < 18446744073709551615 then
-        assert(task("probe", stack_depth_max + 1, 1, &idle_body, null).is_none(),
+        assert(task("probe", stack_depth_max + 1, 1, &idle_body, no_arg).is_none(),
                "a depth the kernel's own type cannot carry is refused rather than truncated")
 
 @test
@@ -92,7 +92,7 @@ a_task_can_be_made_from_storage_the_caller_owns() =
     // The no-heap path, and the one `c const` was needed for: `task_words` is a number only the
     // kernel's headers know, and an array's length must be a constant.
     val t = task_static("static", static_stack[0..<512], static_tcb[0..<task_words], 1,
-                        &idle_body, null).expect("512 words and a control block is a task")
+                        &idle_body, no_arg).expect("512 words and a control block is a task")
 
     assert(t.state == Running, "a statically created task joins the scheduler's lists like any other")
     assert(t.priority == 1, "with the priority it was given")
@@ -102,15 +102,41 @@ a_task_can_be_made_from_storage_the_caller_owns() =
 @test
 static_task_storage_too_small_for_a_control_block_is_refused() =
     assert(task_static("static", static_stack[0..<512], static_tcb[0..<1], 1, &idle_body,
-                       null).is_none(),
+                       no_arg).is_none(),
            "one word is not a control block, and handing it over would have the kernel write past it")
+
+@test
+a_task_is_handed_a_typed_address_rather_than_a_byte_pointer() =
+    // `task` is generic in what its body reads, and `@crossing(arg)` is what makes that worth having:
+    // whatever `arg` points at is walked at this call, so a state holding a plain `&T` is refused here
+    // rather than racing on a board months later. Both halves of that are compile-time, and this test
+    // is what makes the accepting half something the suite runs instead of something a comment claims.
+    //
+    // The kernel is handed the same address either way -- `T` is thrown away on the way out, because
+    // `TaskFunction_t` takes a `void *` -- so there is nothing to read back, and the assertions here
+    // are about the task, as everywhere else in this file. `timer` is where the value can be checked.
+    val made = task("typed", min_stack, 1, &carried_body, &probe_carried)
+    val t = made.expect("one minimal task fits in the test heap")
+
+    assert(t.priority == 1, "a task created with a typed argument is a task like any other")
+
+    t.delete()
+
+    val made_static = task_static("typed", static_stack[0..<512], static_tcb[0..<task_words], 1,
+                                  &carried_body, &probe_carried)
+    val s = made_static.expect("512 words and a control block is a task")
+
+    assert(s.priority == 1, "and so is a statically created one")
+
+    s.delete()
+end a_task_is_handed_a_typed_address_rather_than_a_byte_pointer
 
 @test
 a_notification_raises_the_target_s_value() =
     // The notification lives in the task's own control block, so this works with no scheduler: the
     // give is a write to that block and only the *wait* would need a context switch. `notify_give` is
     // `eIncrement`, which is the discriminator a macro was hiding.
-    val t = task("probe", min_stack, 1, &idle_body, null).expect("one minimal task fits in the test heap")
+    val t = task("probe", min_stack, 1, &idle_body, no_arg).expect("one minimal task fits in the test heap")
 
     assert(t.notify_give(), "notifying a task that is not waiting still succeeds")
     assert(t.notify_give(), "and again — there is no queue to fill")
@@ -135,7 +161,7 @@ the_kernel_calls_a_sysl_callback_with_the_handle_it_was_asked_about() =
     // What is *not* in question, because the compiler refuses it outright, is passing the handle as a
     // `Timer`: a sysl function with an aggregate parameter has no address C can call, and taking one
     // is an error rather than a miscompile. That refusal is why `timer_of` exists.
-    val t = task("probe", min_stack, 1, &idle_body, null).expect("one minimal task fits in the test heap")
+    val t = task("probe", min_stack, 1, &idle_body, no_arg).expect("one minimal task fits in the test heap")
 
     probe_expected = t.handle
     probe_found = false

@@ -15,12 +15,12 @@ module sh.sysl.freertos
 
 @test
 a_created_timer_reports_what_it_was_created_with() =
-    val t = timer("probe", 100, true, null, &probe_tick).expect("one timer fits in the test heap")
+    val t = timer("probe", 100, true, no_arg, &probe_tick).expect("one timer fits in the test heap")
 
     assert(t.period == 100, "the period it was created with, in ticks")
     assert(t.auto_reload, "and it repeats, because that is what was asked for")
     assert(!t.is_active, "but nothing is running: a new timer is dormant until it is started")
-    assert(t.id == null, "and its id is the one handed over, which here is none")
+    assert(t.id == no_arg, "and its id is the one handed over, which here is none")
 
     t.delete(0)
 
@@ -29,7 +29,7 @@ a_timer_s_id_and_reload_mode_can_be_changed() =
     // The id is how one callback serves several timers, so a binding that dropped it -- or that read
     // it back from somewhere other than where it was written -- would make that pattern silently
     // useless rather than fail.
-    val t = timer("probe", 100, false, null, &probe_tick).expect("one timer fits in the test heap")
+    val t = timer("probe", 100, false, no_arg, &probe_tick).expect("one timer fits in the test heap")
 
     assert(!t.auto_reload, "created as a one-shot")
 
@@ -42,6 +42,22 @@ a_timer_s_id_and_reload_mode_can_be_changed() =
     t.delete(0)
 
 @test
+a_typed_id_reaches_the_kernel_unchanged() =
+    // `timer` is generic in its id and casts it away on the way out, which is exactly the kind of step
+    // that can be written against the wrong parameter and still compile -- `xTimerCreate` takes the id
+    // and the callback next to each other, both as pointers.
+    //
+    // The kernel keeps the id and hands it back, so this is the one place in the package where a
+    // `@crossing` argument's *value* can be checked rather than only its type. Everywhere else the
+    // annotation's answer is a diagnostic, and a diagnostic is not something an `@test` can assert.
+    val made = timer("typed", 100, false, &probe_carried, &probe_tick)
+    val t = made.expect("one timer fits in the test heap")
+
+    assert(t.id == carried_ptr(), "the address handed over is the address read back")
+
+    t.delete(0)
+
+@test
 a_command_is_queued_for_the_daemon_rather_than_acted_on() =
     // **A command is a message, and this is the test that says so.** Every one of these is accepted --
     // they differ only in the discriminator a macro was hiding, which is what is being checked -- and
@@ -50,7 +66,7 @@ a_command_is_queued_for_the_daemon_rather_than_acted_on() =
     // That is the single most surprising thing about FreeRTOS timers and the reason `start` is
     // documented as *queued* rather than *started*. A program that starts a timer and immediately
     // tests `is_active` gets `false` on a real board too, if the daemon has not been scheduled yet.
-    val t = timer("probe", 100, true, null, &probe_tick).expect("one timer fits in the test heap")
+    val t = timer("probe", 100, true, no_arg, &probe_tick).expect("one timer fits in the test heap")
 
     assert(t.start(0), "a start is accepted")
     assert(t.stop(0), "so is a stop")
@@ -80,7 +96,7 @@ the_daemon_is_a_task_like_any_other_once_it_exists() =
 
 @test
 a_timer_can_be_made_from_storage_the_caller_owns() =
-    val made = timer_static("static", 100, false, null, &probe_tick,
+    val made = timer_static("static", 100, false, no_arg, &probe_tick,
                             static_timer_control[0..<timer_words])
     val t = made.expect("storage of exactly timer_words words is what the kernel asked for")
 
@@ -93,7 +109,7 @@ a_timer_can_be_made_from_storage_the_caller_owns() =
 static_timer_storage_too_small_for_a_control_block_is_refused() =
     // Refused here rather than passed on, for the reason every `_static` in this package refuses:
     // the kernel would take the pointer and write a whole control block through it.
-    assert(timer_static("small", 100, false, null, &probe_tick,
+    assert(timer_static("small", 100, false, no_arg, &probe_tick,
                         static_timer_control[0..<1]).is_none(),
            "one word is not a control block")
 
