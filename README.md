@@ -3,6 +3,8 @@
 FreeRTOS for sysl — tasks, queues, semaphores, timers, event groups, stream buffers and the interrupt
 half, as a package that declares the kernel you built rather than carrying one.
 
+*An independent sysl package for FreeRTOS. It is not affiliated with or endorsed by FreeRTOS's authors or trademark holders.*
+
 Two tasks and a queue, with the scheduler running and preempting. This is a program that has been
 built and run rather than a sketch; its output is `sum = 6, ticks after 3 receives = 41`.
 
